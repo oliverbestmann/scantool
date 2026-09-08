@@ -1,0 +1,8 @@
+/scantool
+/scantool-linux-*
+/scans/
+*.db
+*.db-shm
+*.db-wal
+/result
+/result-*
