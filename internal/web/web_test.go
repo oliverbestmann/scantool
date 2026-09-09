@@ -50,6 +50,19 @@ func (f *fakeReader) Session(id int64) (store.Session, error) {
 	return store.Session{}, sql.ErrNoRows
 }
 
+func (f *fakeReader) SessionActions(sessionID int64) ([]store.Action, error) {
+	if f.err != nil {
+		return nil, f.err
+	}
+	var out []store.Action
+	for _, a := range f.actions {
+		if a.SessionID == sessionID {
+			out = append(out, a)
+		}
+	}
+	return out, nil
+}
+
 func newServer(t *testing.T, opts web.Options) http.Handler {
 	t.Helper()
 
@@ -106,6 +119,32 @@ func TestIndexHidesControlsWhenDisabled(t *testing.T) {
 	body := get(t, handler, "/").Body.String()
 	if strings.Contains(body, `data-key="a"`) {
 		t.Error("the page offers buttons although web control is disabled")
+	}
+}
+
+func TestDiscardButtonIsDisabledWithoutASession(t *testing.T) {
+	handler := newServer(t, web.Options{
+		State:  func() session.State { return session.State{Status: session.StatusIdle} },
+		Submit: func(session.Action) error { return nil },
+	})
+
+	body := get(t, handler, "/").Body.String()
+	if !strings.Contains(body, `data-action="discard" disabled`) {
+		t.Fatalf("discard button should be disabled without an active session: %s", body)
+	}
+}
+
+func TestDiscardButtonIsEnabledWithASession(t *testing.T) {
+	handler := newServer(t, web.Options{
+		State: func() session.State {
+			return session.State{Status: session.StatusIdle, SessionActive: true, SessionID: 1}
+		},
+		Submit: func(session.Action) error { return nil },
+	})
+
+	body := get(t, handler, "/").Body.String()
+	if !strings.Contains(body, `data-action="discard">Discard`) {
+		t.Fatalf("discard button should be enabled with an active session: %s", body)
 	}
 }
 
@@ -187,14 +226,36 @@ func TestActionLogDefaultsTo50Entries(t *testing.T) {
 	}
 }
 
-func TestDocumentsListedBeforeActionLog(t *testing.T) {
+func TestEmptyHistoryShowsPlaceholder(t *testing.T) {
 	handler := newServer(t, web.Options{})
 
 	body := get(t, handler, "/").Body.String()
-	docs := strings.Index(body, `id="sessions-empty"`)
-	actions := strings.Index(body, `id="actions-empty"`)
-	if docs == -1 || actions == -1 || docs > actions {
-		t.Fatalf("documents (%d) must come before the action log (%d)", docs, actions)
+	if !strings.Contains(body, "Nothing has happened yet.") {
+		t.Fatalf("page does not show the empty state: %s", body)
+	}
+}
+
+func TestBlocksAreOrderedByMostRecentAction(t *testing.T) {
+	older := time.Date(2026, 9, 8, 10, 0, 0, 0, time.UTC)
+	newer := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
+
+	reader := &fakeReader{
+		sessions: []store.Session{
+			{ID: 1, StartedAt: older, Status: store.StatusSaved},
+			{ID: 2, StartedAt: newer, Status: store.StatusActive},
+		},
+		actions: []store.Action{
+			{ID: 1, Time: older, Kind: store.KindSessionStarted, SessionID: 1},
+			{ID: 2, Time: newer, Kind: store.KindSessionStarted, SessionID: 2},
+		},
+	}
+	handler := newServer(t, web.Options{Reader: reader})
+
+	body := get(t, handler, "/").Body.String()
+	first := strings.Index(body, `id="block-session-2"`)
+	second := strings.Index(body, `id="block-session-1"`)
+	if first == -1 || second == -1 || first > second {
+		t.Fatalf("session 2 (more recent) must come before session 1: %s", body)
 	}
 }
 
@@ -275,6 +336,7 @@ func TestActionEndpointQueuesActions(t *testing.T) {
 		"/api/action?key=C":            session.ActionFinish,
 		"/api/action?action=scan-page": session.ActionScanPage,
 		"/api/action?action=finish":    session.ActionFinish,
+		"/api/action?action=discard":   session.ActionDiscard,
 	}
 
 	for path, want := range tests {

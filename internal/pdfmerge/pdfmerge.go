@@ -13,6 +13,13 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/pdfcpu/model"
 )
 
+// pdfcpu otherwise reads/writes a per-user config directory (and its fonts)
+// on first use, which a headless daemon may not have access to (no HOME, a
+// read-only filesystem, ...). Disable it; scantool doesn't need user fonts.
+func init() {
+	api.DisableConfigDir()
+}
+
 // Merger writes the pages, in order, as a single PDF to dest.
 type Merger interface {
 	Merge(pages []string, dest string) error

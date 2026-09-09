@@ -122,6 +122,10 @@ the web UI when a scan fails.
 A cancelled or timed out scan kills the whole process group, so a hanging
 `scanimage` cannot keep the scanner busy.
 
+`--dev-scanner` fakes the scanner instead: it waits 3s and writes a blank
+page, so the rest of scantool (sessions, merging, the web UI) can be
+exercised without a scanner attached.
+
 ### Storing documents
 
 Pages are collected in `<out>/.scantool-work/session-<id>-*` and merged into
@@ -135,8 +139,15 @@ switches to an external tool instead; `{{in}}` expands to the page files and
 
 If merging fails, the scanned pages are deliberately left in the work
 directory and the path is written to the log, so nothing is ever lost.
-Likewise, stopping the daemon with an open document stores that document
-instead of dropping it.
+
+Stopping the daemon (a signal, a crash, a restart) does not finish an open
+document. Its pages are already saved to disk as they are scanned, so
+nothing is lost; the next start picks the same document back up instead of
+finishing it early.
+
+An open document is finished automatically after `--idle-timeout` (default
+5m) of inactivity, so a forgotten "c" does not leave it open forever.
+`--idle-timeout 0` disables this.
 
 ## Web UI
 

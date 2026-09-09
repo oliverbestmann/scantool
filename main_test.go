@@ -84,7 +84,7 @@ func TestDaemonEndToEnd(t *testing.T) {
 	sourceDone := make(chan error, 1)
 
 	loopDone := make(chan error, 1)
-	go func() { loopDone <- loop(ctx, manager, keyCh, actionCh, sourceDone, logger) }()
+	go func() { loopDone <- loop(ctx, manager, keyCh, actionCh, sourceDone, logger, 0) }()
 
 	// The keyboard is a pipe here, everything behind it is the real thing.
 	keyboard, typist, err := os.Pipe()
@@ -132,6 +132,25 @@ func TestDaemonEndToEnd(t *testing.T) {
 	}
 	waitFor(t, "the page requested by the web ui", func() bool { return manager.State().Pages == 4 })
 
+	// The web-triggered action must be attached to the session it acted on,
+	// just like a key press, rather than floating as a session-less entry.
+	actions, err := db.RecentActions(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sawWebAction bool
+	for _, a := range actions {
+		if a.Kind == store.KindWebAction {
+			sawWebAction = true
+			if a.SessionID == 0 {
+				t.Fatalf("web action %+v has no session", a)
+			}
+		}
+	}
+	if !sawWebAction {
+		t.Fatal("no web action was recorded")
+	}
+
 	// "c" stores the document.
 	if _, err := typist.WriteString("c"); err != nil {
 		t.Fatal(err)
@@ -170,9 +189,106 @@ func TestDaemonEndToEnd(t *testing.T) {
 	}
 }
 
-// TestDaemonStoresAnOpenDocumentOnShutdown covers the shutdown path: pages
-// that were already scanned must not be lost when the daemon stops.
-func TestDaemonStoresAnOpenDocumentOnShutdown(t *testing.T) {
+// TestDaemonResumesAnOpenDocumentAfterRestart covers the restart path: pages
+// that were already scanned are never lost, but stopping the daemon must
+// not finish the document either. The next start picks up the same session
+// where it left off, via session.New's recovery.
+func TestDaemonResumesAnOpenDocumentAfterRestart(t *testing.T) {
+	root := t.TempDir()
+	outDir := filepath.Join(root, "scans")
+	dbPath := filepath.Join(root, "scantool.db")
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	scanScript := fakeScanScript(t, root)
+
+	db, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	manager, err := session.New(session.Options{
+		OutDir:   outDir,
+		Scanner:  &scan.ShellScanner{Command: scanScript},
+		Merger:   &pdfmerge.PDFCPU{},
+		Recorder: db,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	keyCh := make(chan rune, 8)
+	loopDone := make(chan error, 1)
+	go func() {
+		loopDone <- loop(ctx, manager, keyCh, make(chan session.Action), make(chan error, 1), logger, 0)
+	}()
+
+	keyCh <- 'a'
+	keyCh <- 'b'
+	waitFor(t, "two scanned pages", func() bool { return manager.State().Pages == 2 })
+
+	// Stopping the daemon, as run() does on a signal, must not finish the
+	// document.
+	cancel()
+	if err := <-loopDone; err != nil {
+		t.Fatalf("loop: %v", err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	docs, err := filepath.Glob(filepath.Join(outDir, "*.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 0 {
+		t.Fatalf("got %d documents, want the open document to stay unfinished after shutdown", len(docs))
+	}
+
+	// The restart: a fresh Manager against the same database and work
+	// directory recovers the still open session instead of losing it.
+	db2, err := store.Open(dbPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db2.Close()
+
+	manager2, err := session.New(session.Options{
+		OutDir:   outDir,
+		Scanner:  &scan.ShellScanner{Command: scanScript},
+		Merger:   &pdfmerge.PDFCPU{},
+		Recorder: db2,
+		Logger:   logger,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state := manager2.State(); !state.SessionActive || state.Pages != 2 {
+		t.Fatalf("recovered state = %+v, want an active session with 2 pages", state)
+	}
+
+	// Finishing it now stores the document, including the pages scanned
+	// before the restart.
+	if err := manager2.Do(t.Context(), session.ActionFinish); err != nil {
+		t.Fatalf("finish: %v", err)
+	}
+
+	docs, err = filepath.Glob(filepath.Join(outDir, "*.pdf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(docs) != 1 {
+		t.Fatalf("got %d documents, want the resumed document to be stored", len(docs))
+	}
+	if pages := testpdf.PageCount(t, docs[0]); pages != 2 {
+		t.Fatalf("document has %d pages, want 2", pages)
+	}
+}
+
+// TestLoopFinishesAnOpenDocumentAfterIdleTimeout covers the auto-finish
+// path: a document left open for --idle-timeout is stored automatically,
+// just like pressing "c".
+func TestLoopFinishesAnOpenDocumentAfterIdleTimeout(t *testing.T) {
 	root := t.TempDir()
 	outDir := filepath.Join(root, "scans")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -195,35 +311,33 @@ func TestDaemonStoresAnOpenDocumentOnShutdown(t *testing.T) {
 	}
 
 	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
 	keyCh := make(chan rune, 8)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- loop(ctx, manager, keyCh, make(chan session.Action), make(chan error, 1), logger)
+		loopDone <- loop(ctx, manager, keyCh, make(chan session.Action), make(chan error, 1), logger, 20*time.Millisecond)
 	}()
 
 	keyCh <- 'a'
-	keyCh <- 'b'
-	waitFor(t, "two scanned pages", func() bool { return manager.State().Pages == 2 })
+	waitFor(t, "one scanned page", func() bool { return manager.State().Pages == 1 })
+
+	waitFor(t, "the document to be finished after the idle timeout", func() bool {
+		return manager.State().LastSavedPath != ""
+	})
+	if manager.State().SessionActive {
+		t.Fatal("session still active after the idle timeout")
+	}
+
+	doc := manager.State().LastSavedPath
+	testpdf.Validate(t, doc)
+	if pages := testpdf.PageCount(t, doc); pages != 1 {
+		t.Fatalf("document has %d pages, want 1", pages)
+	}
 
 	cancel()
 	if err := <-loopDone; err != nil {
 		t.Fatalf("loop: %v", err)
-	}
-
-	// This is what run() does after the loop returns.
-	if err := manager.Close(); err != nil {
-		t.Fatalf("Close: %v", err)
-	}
-
-	docs, err := filepath.Glob(filepath.Join(outDir, "*.pdf"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(docs) != 1 {
-		t.Fatalf("got %d documents, want the open one to be stored", len(docs))
-	}
-	if pages := testpdf.PageCount(t, docs[0]); pages != 2 {
-		t.Fatalf("document has %d pages, want 2", pages)
 	}
 }
 
@@ -245,7 +359,7 @@ func TestLoopStopsWhenTheKeySourceQuits(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- loop(t.Context(), manager, make(chan rune), make(chan session.Action), sourceDone, logger)
+		done <- loop(t.Context(), manager, make(chan rune), make(chan session.Action), sourceDone, logger, 0)
 	}()
 
 	select {
@@ -274,7 +388,7 @@ func TestLoopReportsAFailingKeySource(t *testing.T) {
 	sourceDone := make(chan error, 1)
 	sourceDone <- os.ErrPermission
 
-	err = loop(t.Context(), manager, make(chan rune), make(chan session.Action), sourceDone, logger)
+	err = loop(t.Context(), manager, make(chan rune), make(chan session.Action), sourceDone, logger, 0)
 	if err == nil {
 		t.Fatal("want the loop to report a broken key source, got nil")
 	}

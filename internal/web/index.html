@@ -5,6 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>scantool</title>
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.8/dist/css/bootstrap.min.css" rel="stylesheet" integrity="sha384-sRIl4kxILFvY47J16cr9ZwB07vP4J8+LH7qKQnuqkuIAvNWLzeN8tE5YBujZqJLB" crossorigin="anonymous">
+<link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.3/font/bootstrap-icons.min.css" rel="stylesheet">
 <style>
   /* Times and counts line up nicer with tabular figures. */
   .tnum { font-variant-numeric: tabular-nums; }
@@ -13,6 +14,12 @@
   .action-item .action-head { gap: .5rem; }
   .action-item .action-detail { word-break: break-word; overflow-wrap: anywhere; }
 
+  /* Action log entries are a dense list, not headlines: keep the title
+     close to body size instead of the browser default. */
+  .action-title {
+    font-size: .875rem;
+  }
+
   /* Material-style "caption": small, slightly tighter tracking, for
      secondary text like timestamps and action detail lines. */
   .action-caption {
@@ -20,26 +27,34 @@
     letter-spacing: .01em;
   }
 
-  kbd {
-      margin-right: 4px;
+  /* Small uppercase "overline" label, e.g. for the Session/Pages/... field
+     names in the status card. */
+  .field-label {
+    font-size: .6875rem;
+    font-weight: 600;
+    letter-spacing: .04em;
+    text-transform: uppercase;
+    min-width: 6rem;
+    flex-shrink: 0;
+  }
+
+  /* Action buttons (New/Add/Finish): sized to their content within the
+     btn-group, rather than three equal, text-wrapping columns. */
+  .action-btn {
+    padding: .375rem .875rem;
+    font-size: .8125rem;
   }
 
   @media (max-width: 575.98px) {
-    .btn-group[aria-label="scanner controls"] {
-      display: flex;
-      flex-direction: column;
-      width: 100%;
-    }
-    .btn-group[aria-label="scanner controls"] .btn {
-      width: 100%;
-      border-radius: var(--bs-btn-border-radius) !important;
-    }
-    .btn-group[aria-label="scanner controls"] .btn + .btn {
-      margin-top: .5rem;
-    }
     table.table-sm td, table.table-sm th {
       font-size: .8rem;
     }
+  }
+
+  /* Keep the page a comfortable reading width instead of stretching the
+     dashboard across ultra-wide viewports. */
+  #app {
+    max-width: 760px;
   }
 </style>
 </head>
@@ -52,7 +67,7 @@
   </div>
 </nav>
 
-<main class="container px-3 pb-5" id="app">{{template "content" .}}</main>
+<main class="container mx-auto px-3 pb-5" id="app">{{template "content" .}}</main>
 
 <div class="toast-container position-fixed bottom-0 end-0 p-3">
   <div class="toast align-items-center text-bg-danger border-0" id="toast" role="alert" aria-live="assertive" aria-atomic="true">
@@ -106,13 +121,20 @@ async function refresh() {
 }
 
 document.addEventListener("click", async (e) => {
-  const button = e.target.closest("button[data-key]");
+  const button = e.target.closest("button[data-key], button[data-action]");
   if (!button) return;
 
-  const buttons = document.querySelectorAll("button[data-key]");
+  // Disable immediately to prevent double-submits; refresh() below morphs
+  // in the server's actual disabled state (e.g. still busy scanning), so
+  // don't blindly re-enable afterwards - only on a failed request, where
+  // no server state was applied.
+  const buttons = document.querySelectorAll("button[data-key], button[data-action]");
   buttons.forEach((b) => (b.disabled = true));
   try {
-    const res = await fetch("api/action?key=" + encodeURIComponent(button.dataset.key), { method: "POST" });
+    const query = button.dataset.key
+      ? "key=" + encodeURIComponent(button.dataset.key)
+      : "action=" + encodeURIComponent(button.dataset.action);
+    const res = await fetch("api/action?" + query, { method: "POST" });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       complain(body.error || "request failed with HTTP " + res.status);
@@ -120,7 +142,6 @@ document.addEventListener("click", async (e) => {
     await refresh();
   } catch (e) {
     complain(e.message);
-  } finally {
     buttons.forEach((b) => (b.disabled = false));
   }
 });
@@ -131,7 +152,24 @@ setInterval(refresh, 1000);
 </body>
 </html>
 
+{{define "actionItem"}}
+<div class="list-group-item action-item" id="action-{{.ID}}">
+  <div class="d-flex flex-wrap justify-content-between align-items-baseline gap-2 action-head">
+    <span{{if .Error}} class="action-title text-danger fw-semibold"{{else}} class="action-title fw-semibold"{{end}}>{{actionTitle .}}</span>
+    <span class="action-caption tnum text-body-secondary">{{fmtClock .Time}} Uhr</span>
+  </div>
+  {{if or .Error (actionDetail .) (actionMeta .)}}
+  <div class="action-caption text-body-secondary mt-1">
+    {{if or .Error (actionDetail .)}}<span class="action-detail{{if .Error}} text-danger{{end}}">{{or .Error (actionDetail .)}}</span>{{end}}
+    {{if and (or .Error (actionDetail .)) (actionMeta .)}} · {{end}}
+    {{if actionMeta .}}<span>{{actionMeta .}}</span>{{end}}
+  </div>
+  {{end}}
+</div>
+{{end}}
+
 {{define "content"}}
+  {{$busy := or (eq .State.Status "scanning") (eq .State.Status "saving")}}
   <div class="card mb-4">
     <div class="card-body">
       <div class="d-flex flex-wrap align-items-center gap-2 gap-sm-3 mb-3">
@@ -141,107 +179,68 @@ setInterval(refresh, 1000);
           {{- else if eq .State.Status "error"}}last action failed
           {{- else if .State.SessionActive}}session open, {{.State.Pages}} page(s) scanned
           {{- else}}waiting for a key press{{end}}</span>
-        <div class="spinner-border spinner-border-sm text-primary{{if not (or (eq .State.Status "scanning") (eq .State.Status "saving"))}} d-none{{end}}" id="spinner" role="status">
+        <div class="spinner-border spinner-border-sm text-primary{{if not $busy}} d-none{{end}}" id="spinner" role="status">
           <span class="visually-hidden">busy</span>
         </div>
       </div>
 
       <dl class="row row-cols-1 row-cols-md-2 mb-0 small">
-        <div class="col d-flex gap-2">
-          <dt class="text-body-secondary fw-normal">Session</dt>
+        <div class="col d-flex align-items-baseline gap-2">
+          <dt class="field-label text-body-secondary">Session</dt>
           <dd class="mb-1 tnum" id="f-session">{{if .State.SessionActive}}#{{.State.SessionID}}, started {{fmtDateTime .State.SessionStartedAt}}{{else}}none{{end}}</dd>
         </div>
-        <div class="col d-flex gap-2">
-          <dt class="text-body-secondary fw-normal">Pages</dt>
+        <div class="col d-flex align-items-baseline gap-2">
+          <dt class="field-label text-body-secondary">Pages</dt>
           <dd class="mb-1 tnum" id="f-pages">{{if .State.SessionActive}}{{.State.Pages}}{{else}}—{{end}}</dd>
         </div>
-        <div class="col d-flex gap-2">
-          <dt class="text-body-secondary fw-normal text-nowrap">Last document</dt>
-          <dd class="mb-1 detail" id="f-saved">{{if .State.LastSavedPath}}{{.State.LastSavedPath}} ({{.State.LastSavedPages}} page(s), {{ago .State.LastSavedAt .Now}}){{else}}—{{end}}</dd>
-        </div>
-        <div class="col d-flex gap-2">
-          <dt class="text-body-secondary fw-normal text-nowrap">Last error</dt>
+        <div class="col d-flex align-items-baseline gap-2">
+          <dt class="field-label text-body-secondary text-nowrap">Last error</dt>
           <dd class="mb-1 detail{{if .State.LastError}} text-danger{{end}}" id="f-error">{{if .State.LastError}}{{.State.LastError}} ({{ago .State.LastErrorAt .Now}}){{else}}—{{end}}</dd>
         </div>
       </dl>
 
       {{if .ControlEnabled}}
-      <div class="btn-group mt-3" role="group" aria-label="scanner controls">
-        <button type="button" class="btn btn-outline-primary" data-key="a">
-          <kbd>a</kbd> new document
-        </button>
-        <button type="button" class="btn btn-outline-primary" data-key="b">
-          <kbd>b</kbd> add page
-        </button>
-        <button type="button" class="btn btn-outline-primary" data-key="c">
-          <kbd>c</kbd> finish
-        </button>
+      <div class="d-flex flex-wrap gap-2 mt-3" role="group" aria-label="scanner controls">
+        <button type="button" class="btn btn-primary action-btn" data-key="a"{{if $busy}} disabled{{end}}>New</button>
+        <button type="button" class="btn btn-primary action-btn" data-key="b"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Add</button>
+        <button type="button" class="btn btn-primary action-btn" data-key="c"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Finish</button>
+        <button type="button" class="btn btn-danger action-btn ms-sm-auto" data-action="discard"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Discard</button>
       </div>
       {{end}}
     </div>
   </div>
 
-  <div class="card mb-4">
-    <div class="card-header">Documents</div>
-    <div class="table-responsive">
-      <table class="table table-sm table-hover align-middle mb-0">
-        <thead>
-          <tr>
-            <th scope="col" class="text-end">#</th>
-            <th scope="col">Started</th>
-            <th scope="col" class="d-none d-sm-table-cell">Ended</th>
-            <th scope="col" class="text-end">Pages</th>
-            <th scope="col">Status</th>
-            <th scope="col">File</th>
-          </tr>
-        </thead>
-        <tbody id="sessions">
-          {{range .Sessions}}
-          <tr id="session-{{.ID}}">
-            <td class="text-end tnum">#{{.ID}}</td>
-            <td class="tnum text-nowrap"><div>{{fmtDate .StartedAt}}</div><div class="text-body-secondary">{{fmtClock .StartedAt}} Uhr</div></td>
-            <td class="tnum text-nowrap d-none d-sm-table-cell">{{if .EndedAt}}<div>{{fmtDate .EndedAt}}</div><div class="text-body-secondary">{{fmtClock .EndedAt}} Uhr</div>{{else}}—{{end}}</td>
-            <td class="text-end tnum">{{.Pages}}</td>
-            <td><span class="badge rounded-pill {{sessionBadge .Status}}">{{.Status}}</span></td>
-            <td class="detail small{{if .Error}} text-danger{{else}} text-body-secondary{{end}}">
-              {{if .OutputPath}}<a href="api/sessions/{{.ID}}/download">{{.OutputPath}}</a>{{else}}{{.Error}}{{end}}
-            </td>
-          </tr>
-          {{end}}
-        </tbody>
-      </table>
-    </div>
-    <div class="card-body text-body-secondary small{{if .Sessions}} d-none{{end}}" id="sessions-empty">
-      No documents scanned yet.
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-header">Action log</div>
-    <div class="list-group list-group-flush" id="actions">
-      {{range groupActions .Actions}}
-      <div class="list-group-item action-day py-1 small fw-semibold text-body-secondary bg-body-tertiary" id="action-day-{{.Key}}">{{.Day}}</div>
-      {{range .Actions}}
-      <div class="list-group-item action-item" id="action-{{.ID}}">
-        <div class="d-flex flex-wrap justify-content-between align-items-baseline gap-2 action-head">
-          <span{{if .Error}} class="text-danger fw-semibold"{{else}} class="fw-semibold"{{end}}>{{actionTitle .}}</span>
-          <span class="action-caption tnum text-body-secondary">{{fmtClock .Time}} Uhr</span>
-        </div>
-        {{if or .Error (actionDetail .) (actionMeta .)}}
-        <div class="action-caption text-body-secondary mt-1">
-          {{if or .Error (actionDetail .)}}<span class="action-detail{{if .Error}} text-danger{{end}}">{{or .Error (actionDetail .)}}</span>{{end}}
-          {{if and (or .Error (actionDetail .)) (actionMeta .)}} · {{end}}
-          {{if actionMeta .}}<span>{{actionMeta .}}</span>{{end}}
-        </div>
-        {{end}}
+  <div id="blocks">
+    {{range .Blocks}}
+    {{if .System}}
+    <div class="card mb-3" id="block-{{.ID}}">
+      <div class="card-header small fw-semibold text-body-secondary bg-body-tertiary">System</div>
+      <div class="list-group list-group-flush">
+        {{range .Actions}}{{template "actionItem" .}}{{end}}
       </div>
-      {{end}}
-      {{end}}
     </div>
-    <div class="card-body text-body-secondary small{{if .Actions}} d-none{{end}}" id="actions-empty">
-      Nothing has happened yet.
+    {{else}}
+    <div class="card mb-3" id="block-{{.ID}}">
+      <div class="card-header d-flex flex-wrap align-items-center gap-2">
+        <span class="fw-semibold">Session #{{.Session.ID}}</span>
+        <span class="badge rounded-pill {{sessionBadge .Session.Status}}">{{.Session.Status}}</span>
+        <span class="text-body-secondary small tnum">{{fmtDateTime .Session.StartedAt}}</span>
+        <span class="text-body-secondary small tnum">{{pageCount .Session.Pages}}</span>
+        <div class="ms-auto d-flex align-items-center gap-2">
+          {{if .Session.OutputPath}}<a href="api/sessions/{{.Session.ID}}/download" class="text-body-secondary" title="Download {{base .Session.OutputPath}}" aria-label="Download {{base .Session.OutputPath}}"><i class="bi bi-download"></i></a>
+          {{else if .Session.Error}}<i class="bi bi-exclamation-triangle text-danger" title="{{.Session.Error}}" aria-label="{{.Session.Error}}"></i>{{end}}
+          {{with lemmaryLink $.LemmaryURL .Session.LemmaryID}}<a href="{{.}}" target="_blank" rel="noopener" class="text-body-secondary" title="Open in lemmary" aria-label="Open in lemmary"><i class="bi bi-box-arrow-up-right"></i></a>{{end}}
+        </div>
+      </div>
+      <div class="list-group list-group-flush">
+        {{range .Actions}}{{template "actionItem" .}}{{end}}
+      </div>
     </div>
+    {{end}}
+    {{end}}
   </div>
-
+  <div class="card-body text-body-secondary small{{if .Blocks}} d-none{{end}}" id="blocks-empty">
+    Nothing has happened yet.
+  </div>
 
 {{end}}

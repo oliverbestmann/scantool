@@ -55,18 +55,22 @@ func (f *fakeScanner) count() int {
 	return len(f.requests)
 }
 
-// fakeUploader stands in for the lemary client.
+// fakeUploader stands in for the lemmary client.
 type fakeUploader struct {
 	mu    sync.Mutex
 	paths []string
+	id    string
 	err   error
 }
 
-func (f *fakeUploader) Upload(_ context.Context, path string) error {
+func (f *fakeUploader) Upload(_ context.Context, path string) (string, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.paths = append(f.paths, path)
-	return f.err
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.id, nil
 }
 
 func (f *fakeUploader) uploaded() []string {
@@ -402,6 +406,61 @@ func TestEmptySessionIsDiscarded(t *testing.T) {
 	}
 }
 
+// TestDiscardDropsASessionWithPages verifies that ActionDiscard, unlike
+// finishing an empty session, throws away pages that were already scanned
+// rather than storing them.
+func TestDiscardDropsASessionWithPages(t *testing.T) {
+	h := newHarness(t, nil)
+
+	h.press('a', 'b')
+	if h.scanner.count() != 2 {
+		t.Fatalf("scanned %d pages, want 2", h.scanner.count())
+	}
+
+	if err := h.manager.Do(t.Context(), session.ActionDiscard); err != nil {
+		t.Fatalf("Do(discard): %v", err)
+	}
+
+	if docs := h.documents(); len(docs) != 0 {
+		t.Fatalf("documents = %v, want none", docs)
+	}
+
+	sessions := h.sessions()
+	if len(sessions) != 1 || sessions[0].Status != store.StatusDiscarded || sessions[0].Pages != 2 {
+		t.Fatalf("sessions = %+v, want one discarded session with 2 pages", sessions)
+	}
+	if dirs := h.workDirs(); len(dirs) != 0 {
+		t.Fatalf("work directories left behind: %v", dirs)
+	}
+
+	state := h.manager.State()
+	if state.SessionActive {
+		t.Fatalf("state = %+v, want no active session after discard", state)
+	}
+
+	actions, err := h.db.RecentActions(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if actions[0].Kind != store.KindSessionDiscarded || actions[0].Page != 2 {
+		t.Fatalf("last action = %+v, want a discard with 2 pages", actions[0])
+	}
+}
+
+// TestDiscardWithNoActiveSessionIsANoop verifies that discarding without an
+// open session does nothing rather than erroring or logging a bogus entry.
+func TestDiscardWithNoActiveSessionIsANoop(t *testing.T) {
+	h := newHarness(t, nil)
+
+	if err := h.manager.Do(t.Context(), session.ActionDiscard); err != nil {
+		t.Fatalf("Do(discard): %v", err)
+	}
+
+	if actions := h.actionKinds(); len(actions) != 0 {
+		t.Fatalf("action log = %v, want none", actions)
+	}
+}
+
 func TestFailedScanKeepsTheSessionOpen(t *testing.T) {
 	h := newHarness(t, nil)
 	h.scanner.errs[2] = errors.New("feeder empty")
@@ -664,7 +723,8 @@ type brokenRecorder struct{ session.Recorder }
 
 func (brokenRecorder) CreateSessionWithAction(time.Time) (int64, error) { return 99, nil }
 func (brokenRecorder) AddPage(int64, int, string, store.Action) error   { return errors.New("db gone") }
-func (brokenRecorder) AppendAction(store.Action) error                  { return errors.New("db gone") }
+func (brokenRecorder) AppendAction(store.Action) (int64, error)         { return 0, errors.New("db gone") }
+func (brokenRecorder) SetActionSessionID(int64, int64) error            { return errors.New("db gone") }
 func (brokenRecorder) ActiveSession() (store.Session, error)            { return store.Session{}, sql.ErrNoRows }
 func (brokenRecorder) SessionPages(int64) ([]string, error)             { return nil, nil }
 
@@ -794,7 +854,7 @@ func TestRecoverActiveSessionWithoutWorkDirFailsIt(t *testing.T) {
 // on the session, in the action log, and that the document is kept on disk
 // so a failed upload could be retried later.
 func TestFinishUploadsTheDocumentAndRecordsSuccess(t *testing.T) {
-	uploader := &fakeUploader{}
+	uploader := &fakeUploader{id: "record-123"}
 	h := newHarness(t, func(o *session.Options) { o.Uploader = uploader })
 
 	h.press('a', 'b', 'c')
@@ -805,6 +865,9 @@ func TestFinishUploadsTheDocumentAndRecordsSuccess(t *testing.T) {
 	}
 	if sessions[0].UploadStatus != store.UploadUploaded {
 		t.Fatalf("upload_status = %q, want %q", sessions[0].UploadStatus, store.UploadUploaded)
+	}
+	if sessions[0].LemmaryID != "record-123" {
+		t.Fatalf("lemmary_id = %q, want record-123", sessions[0].LemmaryID)
 	}
 
 	docs := h.documents()
@@ -918,6 +981,27 @@ func TestActionLogOfAFullDocument(t *testing.T) {
 	}
 	if filepath.Base(saved.Detail) != "20260908-114400.pdf" {
 		t.Fatalf("stored action detail = %q, want the document path", saved.Detail)
+	}
+}
+
+// TestKeyPressStartingASessionIsAttachedToIt verifies that the key press
+// which starts a session from idle (the common case: pressing "b" to scan
+// the first page) is recorded against the session it created, rather than
+// being logged as a session-less entry, since it happened before the
+// session existed.
+func TestKeyPressStartingASessionIsAttachedToIt(t *testing.T) {
+	h := newHarness(t, nil)
+
+	h.press('b')
+
+	actions, err := h.db.RecentActions(100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range actions {
+		if a.Kind == store.KindKeyPressed && a.SessionID == 0 {
+			t.Fatalf("key press %+v has no session, want it attached to session 1", a)
+		}
 	}
 }
 

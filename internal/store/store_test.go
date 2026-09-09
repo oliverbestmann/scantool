@@ -114,10 +114,10 @@ func TestActionLogRoundTrip(t *testing.T) {
 		Page:      2,
 		Detail:    "/scans/page-002.pdf",
 	}
-	if err := db.AppendAction(want); err != nil {
+	if _, err := db.AppendAction(want); err != nil {
 		t.Fatalf("AppendAction: %v", err)
 	}
-	if err := db.AppendAction(store.Action{Time: now.Add(time.Second), Kind: store.KindScanFailed, SessionID: 7, Error: "device busy"}); err != nil {
+	if _, err := db.AppendAction(store.Action{Time: now.Add(time.Second), Kind: store.KindScanFailed, SessionID: 7, Error: "device busy"}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -164,12 +164,12 @@ func TestSessionActionsAreOldestFirst(t *testing.T) {
 
 	now := time.Now()
 	for i, kind := range []store.Kind{store.KindSessionStarted, store.KindPageScanned, store.KindSessionSaved} {
-		err := db.AppendAction(store.Action{Time: now.Add(time.Duration(i) * time.Second), Kind: kind, SessionID: 3})
+		_, err := db.AppendAction(store.Action{Time: now.Add(time.Duration(i) * time.Second), Kind: kind, SessionID: 3})
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := db.AppendAction(store.Action{Time: now, Kind: store.KindPageScanned, SessionID: 4}); err != nil {
+	if _, err := db.AppendAction(store.Action{Time: now, Kind: store.KindPageScanned, SessionID: 4}); err != nil {
 		t.Fatal(err)
 	}
 
@@ -190,7 +190,7 @@ func TestTrimActionsKeepsNewest(t *testing.T) {
 
 	now := time.Now()
 	for i := range 10 {
-		err := db.AppendAction(store.Action{Time: now.Add(time.Duration(i) * time.Second), Kind: store.KindKeyPressed, Detail: "b"})
+		_, err := db.AppendAction(store.Action{Time: now.Add(time.Duration(i) * time.Second), Kind: store.KindKeyPressed, Detail: "b"})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -215,7 +215,7 @@ func TestTrimActionsKeepsNewest(t *testing.T) {
 func TestTrimActionsBelowLimitKeepsEverything(t *testing.T) {
 	db := open(t)
 
-	if err := db.AppendAction(store.Action{Kind: store.KindDaemonStarted}); err != nil {
+	if _, err := db.AppendAction(store.Action{Kind: store.KindDaemonStarted}); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.TrimActions(100); err != nil {
@@ -234,7 +234,7 @@ func TestTrimActionsBelowLimitKeepsEverything(t *testing.T) {
 func TestAppendActionDefaultsTime(t *testing.T) {
 	db := open(t)
 
-	if err := db.AppendAction(store.Action{Kind: store.KindDaemonStarted}); err != nil {
+	if _, err := db.AppendAction(store.Action{Kind: store.KindDaemonStarted}); err != nil {
 		t.Fatal(err)
 	}
 

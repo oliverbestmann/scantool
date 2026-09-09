@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"html/template"
 	"path/filepath"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/oliverbestmann/scantool/internal/store"
@@ -17,6 +19,7 @@ var actionLabels = map[store.Kind]string{
 	store.KindDaemonStopped:    "Daemon stopped",
 	store.KindKeyPressed:       "Key pressed",
 	store.KindKeyIgnored:       "Key ignored",
+	store.KindIdleTimeout:      "Idle timeout, document finished",
 	store.KindWebAction:        "Requested from web",
 	store.KindSessionStarted:   "Session started",
 	store.KindPageScanned:      "Page scanned",
@@ -60,7 +63,12 @@ func actionTitle(a store.Action) string {
 		}
 		return actionLabel(a.Kind) + ": " + a.Detail
 	case store.KindSessionSaved:
-		return fmt.Sprintf("%s: %s, %s", actionLabel(a.Kind), filepath.Base(a.Detail), pageCount(a.Page))
+		return fmt.Sprintf("%s: %s", actionLabel(a.Kind), pageCount(a.Page))
+	case store.KindSessionDiscarded:
+		if a.Page == 0 {
+			return actionLabel(a.Kind)
+		}
+		return fmt.Sprintf("%s: %s", actionLabel(a.Kind), pageCount(a.Page))
 	default:
 		return actionLabel(a.Kind)
 	}
@@ -78,8 +86,10 @@ func pageCount(n int) string {
 // or "" when actionTitle already folded the detail into the heading.
 func actionDetail(a store.Action) string {
 	switch a.Kind {
-	case store.KindKeyPressed, store.KindKeyIgnored, store.KindWebAction, store.KindSessionSaved:
+	case store.KindKeyPressed, store.KindKeyIgnored, store.KindWebAction:
 		return ""
+	case store.KindSessionSaved:
+		return filepath.Base(a.Detail)
 	default:
 		return a.Detail
 	}
@@ -125,16 +135,16 @@ func fmtDate(v any) string {
 	return t.Local().Format("02.01.2006")
 }
 
-// fmtClock renders t as a German 24h clock, e.g. "14:32:07".
+// fmtClock renders t as a German 24h clock, e.g. "14:32".
 func fmtClock(v any) string {
 	t := asTime(v)
 	if t.IsZero() {
 		return ""
 	}
-	return t.Local().Format("15:04:05")
+	return t.Local().Format("15:04")
 }
 
-// fmtDateTime renders t as "10.09.2026, 14:32:07 Uhr".
+// fmtDateTime renders t as "10.09.2026, 14:32 Uhr".
 func fmtDateTime(v any) string {
 	t := asTime(v)
 	if t.IsZero() {
@@ -165,51 +175,121 @@ func ago(t time.Time, now time.Time) string {
 // inc adds one, since Go templates have no arithmetic operators.
 func inc(n int) int { return n + 1 }
 
-// actionMeta renders the "session #.. · page .." line under an action item,
-// or "" when the action carries no session/page. For KindSessionSaved, Page
-// is the document's total page count, already shown by actionTitle, so it's
-// left out here to avoid repeating it.
+// lemmaryLink builds the URL of a session's document on the lemmary server,
+// or "" when either baseURL or id is unset.
+func lemmaryLink(baseURL, id string) string {
+	if baseURL == "" || id == "" {
+		return ""
+	}
+	return strings.TrimRight(baseURL, "/") + "/document/" + id
+}
+
+// actionMeta renders the "page .." line under an action item, or "" when
+// the action carries no page or belongs to a group header that already
+// names the session. For KindSessionSaved, Page is the document's total
+// page count, already shown by actionTitle, so it's left out here to avoid
+// repeating it.
 func actionMeta(a store.Action) string {
-	meta := ""
-	if a.SessionID != 0 {
-		meta = fmt.Sprintf("session #%d", a.SessionID)
+	if a.Page != 0 && a.Kind != store.KindSessionSaved && a.Kind != store.KindSessionDiscarded {
+		return fmt.Sprintf("page %d", a.Page)
 	}
-	if a.Page != 0 && a.Kind != store.KindSessionSaved {
-		if meta != "" {
-			meta += " · "
-		}
-		meta += fmt.Sprintf("page %d", a.Page)
-	}
-	return meta
+	return ""
 }
 
-// actionGroup is one day's worth of action log entries, oldest grouping
-// unit shown in the UI; actions within stay in their original (newest
-// first) order.
+// actionGroup is one contiguous run of action log entries sharing a session
+// (or none). It's an intermediate step towards block, below, used to pick
+// out the runs of session-less actions (daemon start/stop) that fall
+// between sessions.
 type actionGroup struct {
-	Key     string
-	Day     string
-	Actions []store.Action
+	// ID is the first action's id in the group, used as a stable, unique DOM
+	// id: the session id alone would repeat across separate system runs.
+	ID        int64
+	SessionID int64
+	Actions   []store.Action
 }
 
-// groupActionsByDay groups actions (assumed newest first) by local
-// calendar day, preserving order. Mirrors the grouping done client side in
-// renderActions() for the polling path, so the two must produce identical
-// markup for morphdom to diff cleanly.
-func groupActionsByDay(actions []store.Action) []actionGroup {
+// groupActionsBySession groups actions (assumed sorted by time) into
+// contiguous runs sharing a session id, including the pseudo id 0 for
+// actions with no session (daemon started/stopped).
+func groupActionsBySession(actions []store.Action) []actionGroup {
 	var groups []actionGroup
-	for _, a := range actions {
-		key := "unknown"
-		if !a.Time.IsZero() {
-			key = a.Time.Local().Format("2006-01-02")
-		}
-		if len(groups) == 0 || groups[len(groups)-1].Key != key {
-			groups = append(groups, actionGroup{Key: key, Day: fmtDate(a.Time)})
+	var lastSessionID int64
+	for i, a := range actions {
+		if i == 0 || a.SessionID != lastSessionID {
+			groups = append(groups, actionGroup{ID: a.ID, SessionID: a.SessionID})
+			lastSessionID = a.SessionID
 		}
 		g := &groups[len(groups)-1]
 		g.Actions = append(g.Actions, a)
 	}
 	return groups
+}
+
+// block is one card shown on the page: either a session's full history — its
+// actions plus its outcome (status, download, upload) — or a run of actions
+// with no session, e.g. a daemon start/stop. Blocks are the unit the
+// Documents table and action log used to show separately; combining them
+// means a session's actions sit right next to what they produced.
+type block struct {
+	// ID is a stable, unique DOM id.
+	ID      string
+	System  bool
+	Session store.Session
+	// Actions is newest first, matching the rest of the page.
+	Actions []store.Action
+	// Latest is the block's most recent action's time, or, for a session
+	// with none loaded, its start time; used to sort blocks.
+	Latest time.Time
+}
+
+// buildBlocks merges sessions (with their own full action history) and the
+// system-only action runs found in recentActions (daemon started/stopped)
+// into one newest-first list of blocks, so the page shows one interleaved
+// timeline instead of a documents table and a separate action log.
+func buildBlocks(sessions []store.Session, sessionActions map[int64][]store.Action, recentActions []store.Action) []block {
+	blocks := make([]block, 0, len(sessions))
+
+	for _, sess := range sessions {
+		// SessionActions returns oldest first; the page reads newest first,
+		// consistent with everything else on it.
+		actions := sessionActions[sess.ID]
+		reversed := make([]store.Action, len(actions))
+		for i, a := range actions {
+			reversed[len(actions)-1-i] = a
+		}
+
+		latest := sess.StartedAt
+		switch {
+		case len(reversed) > 0:
+			latest = reversed[0].Time
+		case sess.EndedAt != nil:
+			latest = *sess.EndedAt
+		}
+
+		blocks = append(blocks, block{
+			ID:      fmt.Sprintf("session-%d", sess.ID),
+			Session: sess,
+			Actions: reversed,
+			Latest:  latest,
+		})
+	}
+
+	for _, g := range groupActionsBySession(recentActions) {
+		if g.SessionID != 0 {
+			// Covered by its own session block above, built from the
+			// session's complete history rather than this trimmed window.
+			continue
+		}
+		blocks = append(blocks, block{
+			ID:      fmt.Sprintf("system-%d", g.ID),
+			System:  true,
+			Actions: g.Actions,
+			Latest:  g.Actions[0].Time,
+		})
+	}
+
+	sort.SliceStable(blocks, func(i, j int) bool { return blocks[i].Latest.After(blocks[j].Latest) })
+	return blocks
 }
 
 var templateFuncs = template.FuncMap{
@@ -223,6 +303,8 @@ var templateFuncs = template.FuncMap{
 	"statusBadge":  statusBadge,
 	"sessionBadge": sessionBadge,
 	"actionMeta":   actionMeta,
+	"pageCount":    pageCount,
 	"inc":          inc,
-	"groupActions": groupActionsByDay,
+	"base":         filepath.Base,
+	"lemmaryLink":  lemmaryLink,
 }

@@ -14,6 +14,12 @@ import (
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 )
 
+// pdfcpu otherwise reads/writes a per-user config directory on first use;
+// disable it so tests don't depend on it being accessible.
+func init() {
+	api.DisableConfigDir()
+}
+
 // Write creates a valid single page PDF at path. The page is a small solid
 // colour image, which is enough for merging and page counting.
 func Write(t *testing.T, path string, shade uint8) {

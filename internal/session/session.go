@@ -30,6 +30,9 @@ const (
 	ActionScanPage Action = "scan-page"
 	// ActionFinish stores the current session as a PDF. Bound to "c".
 	ActionFinish Action = "finish"
+	// ActionDiscard drops the current session without storing it, whether or
+	// not it holds pages. Not bound to a key; only reachable from the web UI.
+	ActionDiscard Action = "discard"
 )
 
 // Status describes what the daemon is doing right now.
@@ -70,8 +73,12 @@ type Recorder interface {
 	FinishSessionWithAction(id int64, endedAt time.Time, status, outputPath, errMsg string, action store.Action) error
 	// RecordUploadWithAction stores the outcome of uploading a session's
 	// document and appends the matching action, atomically.
-	RecordUploadWithAction(id int64, status, errMsg string, action store.Action) error
-	AppendAction(a store.Action) error
+	RecordUploadWithAction(id int64, status, lemmaryID, errMsg string, action store.Action) error
+	// AppendAction stores one action log entry and returns its id.
+	AppendAction(a store.Action) (int64, error)
+	// SetActionSessionID attaches a session to an action log entry recorded
+	// before the session existed, e.g. the key press that started it.
+	SetActionSessionID(actionID, sessionID int64) error
 	// ActiveSession returns the most recent session still marked active, so
 	// a restarted daemon can resume it instead of losing track of it. It
 	// returns sql.ErrNoRows if none is active.
@@ -81,10 +88,11 @@ type Recorder interface {
 	SessionPages(sessionID int64) ([]string, error)
 }
 
-// Uploader posts a finished document somewhere else, e.g. a lemary server.
-// *lemary.Client implements it.
+// Uploader posts a finished document somewhere else, e.g. a lemmary server.
+// *lemmary.Client implements it. It returns the id of the record created on
+// the remote server.
 type Uploader interface {
-	Upload(ctx context.Context, path string) error
+	Upload(ctx context.Context, path string) (string, error)
 }
 
 // State is a snapshot of the daemon for the web UI.
@@ -251,17 +259,36 @@ func (m *Manager) HandleKey(ctx context.Context, key rune) error {
 	action, ok := ActionForKey(key)
 	if !ok {
 		m.opts.Logger.Debug("ignoring key", "key", string(key))
-		m.record(store.Action{Kind: store.KindKeyIgnored, Detail: string(key)})
+		m.record(store.Action{Kind: store.KindKeyIgnored, Detail: string(key), SessionID: m.State().SessionID})
 		return nil
 	}
 
 	m.opts.Logger.Info("key pressed", "key", string(key), "action", string(action))
-	m.record(store.Action{
-		Kind:      store.KindKeyPressed,
-		Detail:    string(key),
-		SessionID: m.State().SessionID,
-	})
-	return m.Do(ctx, action)
+	return m.DoLogged(ctx, action, store.KindKeyPressed, string(key))
+}
+
+// DoLogged performs action like Do, additionally recording kind/detail as
+// the action log entry for whatever triggered it (a key press, a web
+// request). The entry is attached to the session active beforehand, or, if
+// none was active yet (the action starts one, e.g. scanning the first page
+// from idle), to the session Do just created — so the triggering event
+// always ends up inside the session it affected instead of floating as a
+// session-less entry.
+func (m *Manager) DoLogged(ctx context.Context, action Action, kind store.Kind, detail string) error {
+	preSessionID := m.State().SessionID
+	actionID := m.record(store.Action{Kind: kind, Detail: detail, SessionID: preSessionID})
+
+	err := m.Do(ctx, action)
+
+	if preSessionID == 0 {
+		if sessionID := m.State().SessionID; sessionID != 0 {
+			if patchErr := m.opts.Recorder.SetActionSessionID(actionID, sessionID); patchErr != nil {
+				m.opts.Logger.Warn("could not attach session to action", "error", patchErr)
+			}
+		}
+	}
+
+	return err
 }
 
 // Do performs an action.
@@ -286,6 +313,9 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 
 	case ActionFinish:
 		return m.finish(ctx)
+
+	case ActionDiscard:
+		return m.discard()
 
 	default:
 		return fmt.Errorf("session: unknown action %q", action)
@@ -394,22 +424,14 @@ func (m *Manager) finish(ctx context.Context) error {
 		return nil
 	}
 
-	log := m.opts.Logger.With("session", cur.id)
-	now := m.opts.Now()
-
 	// An empty session has nothing worth storing, e.g. "c" right after a
 	// failed first scan.
 	if len(cur.pages) == 0 {
-		log.Info("session discarded, no pages scanned")
-		err := m.opts.Recorder.FinishSessionWithAction(cur.id, now, store.StatusDiscarded, "", "",
-			store.Action{Kind: store.KindSessionDiscarded, SessionID: cur.id})
-		if err != nil {
-			log.Warn("could not record discarded session", "error", err)
-		}
-		m.removeWork(cur, log)
-		m.clear(StatusIdle)
-		return nil
+		return m.discard()
 	}
+
+	log := m.opts.Logger.With("session", cur.id)
+	now := m.opts.Now()
 
 	m.setStatus(StatusSaving)
 
@@ -466,17 +488,46 @@ func (m *Manager) finish(ctx context.Context) error {
 	return nil
 }
 
+// discard drops the current session without storing it, whether or not it
+// holds pages. Must be called with runMu held.
+func (m *Manager) discard() error {
+	cur := m.cur
+	if cur == nil {
+		m.opts.Logger.Info("no active session to discard")
+		return nil
+	}
+
+	log := m.opts.Logger.With("session", cur.id)
+	now := m.opts.Now()
+
+	if err := m.opts.Recorder.FinishSessionWithAction(cur.id, now, store.StatusDiscarded, "", "",
+		store.Action{Kind: store.KindSessionDiscarded, SessionID: cur.id, Page: len(cur.pages)}); err != nil {
+		log.Warn("could not record discarded session", "error", err)
+	}
+
+	m.removeWork(cur, log)
+	m.clear(StatusIdle)
+
+	log.Info("session discarded", "pages", len(cur.pages))
+	return nil
+}
+
 // Record adds an entry to the action log. Used by the daemon for events that
 // are not part of the state machine, such as startup and shutdown.
 func (m *Manager) Record(a store.Action) { m.record(a) }
 
-func (m *Manager) record(a store.Action) {
+// record appends a to the action log and returns its id, so a caller that
+// logged an event before its session existed can attach the session once
+// known, via DoLogged.
+func (m *Manager) record(a store.Action) int64 {
 	if a.Time.IsZero() {
 		a.Time = m.opts.Now()
 	}
-	if err := m.opts.Recorder.AppendAction(a); err != nil {
+	id, err := m.opts.Recorder.AppendAction(a)
+	if err != nil {
 		m.opts.Logger.Warn("could not append to action log", "error", err, "kind", string(a.Kind))
 	}
+	return id
 }
 
 // upload posts the finished document and records the outcome on the
@@ -486,16 +537,17 @@ func (m *Manager) upload(ctx context.Context, sessionID int64, path string, log 
 	status, errMsg := store.UploadUploaded, ""
 	kind := store.KindUploadSucceeded
 
-	if err := m.opts.Uploader.Upload(ctx, path); err != nil {
+	lemmaryID, err := m.opts.Uploader.Upload(ctx, path)
+	if err != nil {
 		log.Error("could not upload document", "error", err, "path", path)
 		status, errMsg = store.UploadFailed, err.Error()
 		kind = store.KindUploadFailed
 	} else {
-		log.Info("document uploaded", "path", path)
+		log.Info("document uploaded", "path", path, "lemmary_id", lemmaryID)
 	}
 
 	action := store.Action{Kind: kind, SessionID: sessionID, Detail: path, Error: errMsg}
-	if err := m.opts.Recorder.RecordUploadWithAction(sessionID, status, errMsg, action); err != nil {
+	if err := m.opts.Recorder.RecordUploadWithAction(sessionID, status, lemmaryID, errMsg, action); err != nil {
 		log.Warn("could not record upload outcome", "error", err)
 	}
 }
@@ -563,7 +615,8 @@ type nopRecorder struct{}
 
 func (nopRecorder) CreateSessionWithAction(time.Time) (int64, error) { return 0, nil }
 func (nopRecorder) AddPage(int64, int, string, store.Action) error   { return nil }
-func (nopRecorder) AppendAction(store.Action) error                  { return nil }
+func (nopRecorder) AppendAction(store.Action) (int64, error)         { return 0, nil }
+func (nopRecorder) SetActionSessionID(int64, int64) error            { return nil }
 func (nopRecorder) SessionPages(int64) ([]string, error)             { return nil, nil }
 func (nopRecorder) ActiveSession() (store.Session, error)            { return store.Session{}, sql.ErrNoRows }
 
@@ -571,4 +624,6 @@ func (nopRecorder) FinishSessionWithAction(int64, time.Time, string, string, str
 	return nil
 }
 
-func (nopRecorder) RecordUploadWithAction(int64, string, string, store.Action) error { return nil }
+func (nopRecorder) RecordUploadWithAction(int64, string, string, string, store.Action) error {
+	return nil
+}

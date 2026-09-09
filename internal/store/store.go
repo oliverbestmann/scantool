@@ -37,6 +37,7 @@ const (
 	KindKeyPressed       Kind = "key-pressed"
 	KindWebAction        Kind = "web-action"
 	KindKeyIgnored       Kind = "key-ignored"
+	KindIdleTimeout      Kind = "idle-timeout"
 	KindSessionStarted   Kind = "session-started"
 	KindPageScanned      Kind = "page-scanned"
 	KindScanFailed       Kind = "scan-failed"
@@ -68,6 +69,9 @@ type Session struct {
 	Error        string     `json:"error,omitempty"`
 	UploadStatus string     `json:"upload_status,omitempty"`
 	UploadError  string     `json:"upload_error,omitempty"`
+	// LemmaryID is the record id the lemmary server assigned the document on
+	// upload, so it can be looked up there later.
+	LemmaryID string `json:"lemmary_id,omitempty"`
 }
 
 // Action is one entry of the action log.
@@ -97,7 +101,8 @@ CREATE TABLE IF NOT EXISTS sessions (
 	output_path   TEXT NOT NULL DEFAULT '',
 	error         TEXT NOT NULL DEFAULT '',
 	upload_status TEXT NOT NULL DEFAULT '',
-	upload_error  TEXT NOT NULL DEFAULT ''
+	upload_error  TEXT NOT NULL DEFAULT '',
+	lemmary_id    TEXT NOT NULL DEFAULT ''
 );
 
 CREATE TABLE IF NOT EXISTS pages (
@@ -170,6 +175,7 @@ func migrate(db *sql.DB) error {
 	columns := []string{
 		`ALTER TABLE sessions ADD COLUMN upload_status TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE sessions ADD COLUMN upload_error TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN lemmary_id TEXT NOT NULL DEFAULT ''`,
 	}
 	for _, stmt := range columns {
 		if _, err := db.Exec(stmt); err != nil {
@@ -217,7 +223,8 @@ func (s *Store) CreateSessionWithAction(startedAt time.Time) (int64, error) {
 		if id, err = insertSession(tx, startedAt); err != nil {
 			return err
 		}
-		return insertAction(tx, Action{Kind: KindSessionStarted, SessionID: id, Time: startedAt})
+		_, err = insertAction(tx, Action{Kind: KindSessionStarted, SessionID: id, Time: startedAt})
+		return err
 	})
 	if err != nil {
 		return 0, err
@@ -249,7 +256,8 @@ func (s *Store) AddPage(sessionID int64, page int, path string, action Action) e
 		if _, err := tx.Exec(`UPDATE sessions SET pages = ? WHERE id = ?`, page, sessionID); err != nil {
 			return fmt.Errorf("store: update session pages: %w", err)
 		}
-		return insertAction(tx, action)
+		_, err := insertAction(tx, action)
+		return err
 	})
 }
 
@@ -283,21 +291,24 @@ func (s *Store) FinishSessionWithAction(id int64, endedAt time.Time, status, out
 		); err != nil {
 			return fmt.Errorf("store: finish session: %w", err)
 		}
-		return insertAction(tx, action)
+		_, err := insertAction(tx, action)
+		return err
 	})
 }
 
 // RecordUploadWithAction stores the outcome of uploading a session's
-// document and appends the matching action, in one transaction.
-func (s *Store) RecordUploadWithAction(id int64, status, errMsg string, action Action) error {
+// document, including the lemmary record id on success, and appends the
+// matching action, in one transaction.
+func (s *Store) RecordUploadWithAction(id int64, status, lemmaryID, errMsg string, action Action) error {
 	return s.withTx(func(tx *sql.Tx) error {
 		if _, err := tx.Exec(
-			`UPDATE sessions SET upload_status = ?, upload_error = ? WHERE id = ?`,
-			status, errMsg, id,
+			`UPDATE sessions SET upload_status = ?, upload_error = ?, lemmary_id = ? WHERE id = ?`,
+			status, errMsg, lemmaryID, id,
 		); err != nil {
 			return fmt.Errorf("store: record upload: %w", err)
 		}
-		return insertAction(tx, action)
+		_, err := insertAction(tx, action)
+		return err
 	})
 }
 
@@ -306,7 +317,7 @@ func (s *Store) RecordUploadWithAction(id int64, status, errMsg string, action A
 // active.
 func (s *Store) ActiveSession() (Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error
+		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error, lemmary_id
 		FROM sessions WHERE status = ? ORDER BY id DESC LIMIT 1`, StatusActive)
 	if err != nil {
 		return Session{}, fmt.Errorf("store: query active session: %w", err)
@@ -326,7 +337,7 @@ func (s *Store) ActiveSession() (Session, error) {
 // Session loads a single session by id.
 func (s *Store) Session(id int64) (Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error
+		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error, lemmary_id
 		FROM sessions WHERE id = ?`, id)
 	if err != nil {
 		return Session{}, fmt.Errorf("store: query session: %w", err)
@@ -346,7 +357,7 @@ func (s *Store) Session(id int64) (Session, error) {
 // RecentSessions returns the newest sessions, most recent first.
 func (s *Store) RecentSessions(limit int) ([]Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error
+		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error, lemmary_id
 		FROM sessions ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: query sessions: %w", err)
@@ -363,7 +374,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 			started string
 			ended   sql.NullString
 		)
-		if err := rows.Scan(&sess.ID, &started, &ended, &sess.Pages, &sess.Status, &sess.OutputPath, &sess.Error, &sess.UploadStatus, &sess.UploadError); err != nil {
+		if err := rows.Scan(&sess.ID, &started, &ended, &sess.Pages, &sess.Status, &sess.OutputPath, &sess.Error, &sess.UploadStatus, &sess.UploadError, &sess.LemmaryID); err != nil {
 			return nil, fmt.Errorf("store: scan session: %w", err)
 		}
 
@@ -383,26 +394,37 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 	return out, rows.Err()
 }
 
-// AppendAction stores one entry of the action log. The ID field is ignored.
-func (s *Store) AppendAction(a Action) error {
-	if err := insertAction(s.db, a); err != nil {
-		return err
-	}
-	return nil
+// AppendAction stores one entry of the action log and returns its id, so a
+// caller that logged an event before its session existed (e.g. the key press
+// that starts one) can attach the session once known, via
+// SetActionSessionID. The ID field of a is ignored.
+func (s *Store) AppendAction(a Action) (int64, error) {
+	return insertAction(s.db, a)
 }
 
-func insertAction(q querier, a Action) error {
+func insertAction(q querier, a Action) (int64, error) {
 	if a.Time.IsZero() {
 		a.Time = time.Now()
 	}
 
-	_, err := q.Exec(
+	res, err := q.Exec(
 		`INSERT INTO actions (time, kind, session_id, page, detail, error)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		formatTime(a.Time), string(a.Kind), a.SessionID, a.Page, a.Detail, a.Error,
 	)
 	if err != nil {
-		return fmt.Errorf("store: insert action: %w", err)
+		return 0, fmt.Errorf("store: insert action: %w", err)
+	}
+	return res.LastInsertId()
+}
+
+// SetActionSessionID attaches a session to an action log entry that was
+// recorded before the session existed, e.g. the key press or web request
+// that started it. It only touches rows still unattached, so it can't
+// clobber a legitimate value.
+func (s *Store) SetActionSessionID(actionID, sessionID int64) error {
+	if _, err := s.db.Exec(`UPDATE actions SET session_id = ? WHERE id = ? AND session_id = 0`, sessionID, actionID); err != nil {
+		return fmt.Errorf("store: set action session: %w", err)
 	}
 	return nil
 }

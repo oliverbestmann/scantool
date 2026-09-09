@@ -29,6 +29,10 @@ type Reader interface {
 	RecentActions(limit int) ([]store.Action, error)
 	// Session loads a single session by id, for downloading its document.
 	Session(id int64) (store.Session, error)
+	// SessionActions returns one session's full action history, oldest
+	// first, so its card shows everything that happened regardless of the
+	// action log's own trim window.
+	SessionActions(sessionID int64) ([]store.Action, error)
 }
 
 // Options configures the Server.
@@ -42,6 +46,10 @@ type Options struct {
 	// Submit queues an action triggered from the browser. When nil the page
 	// is read only.
 	Submit func(session.Action) error
+	// LemmaryURL is the base URL of the lemmary server documents were
+	// uploaded to, used to link a session to its document there. Empty
+	// disables the link.
+	LemmaryURL string
 	// Limit is how many sessions (documents) to show. Defaults to 100.
 	Limit int
 	// ActionsLimit is how many action log entries to show. Defaults to 50.
@@ -89,6 +97,7 @@ type snapshot struct {
 	Sessions       []store.Session `json:"sessions"`
 	Actions        []store.Action  `json:"actions"`
 	ControlEnabled bool            `json:"control_enabled"`
+	LemmaryURL     string          `json:"lemmary_url,omitempty"`
 }
 
 // Handler returns the HTTP routes.
@@ -129,16 +138,16 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return nil
 }
 
-// indexData is the payload rendered by index.html. Its Actions/Sessions are
-// rendered into the same markup (same classes, same per-item ids) that the
-// polling JS produces from /api/state, so morphdom can diff the two without
-// tearing the DOM down on first refresh.
+// indexData is the payload rendered by index.html. Its Blocks are rendered
+// into the same markup (same classes, same per-item ids) that the polling JS
+// produces from /api/fragment, so morphdom can diff the two without tearing
+// the DOM down on first refresh.
 type indexData struct {
 	ControlEnabled bool
 	Now            time.Time
 	State          session.State
-	Sessions       []store.Session
-	Actions        []store.Action
+	Blocks         []block
+	LemmaryURL     string
 }
 
 // loadIndexData gathers the data shown on the page, shared by the full page
@@ -149,7 +158,16 @@ func (s *Server) loadIndexData() (indexData, error) {
 		return indexData{}, err
 	}
 
-	actions, err := s.opts.Reader.RecentActions(s.opts.ActionsLimit)
+	sessionActions := make(map[int64][]store.Action, len(sessions))
+	for _, sess := range sessions {
+		actions, err := s.opts.Reader.SessionActions(sess.ID)
+		if err != nil {
+			return indexData{}, err
+		}
+		sessionActions[sess.ID] = actions
+	}
+
+	recentActions, err := s.opts.Reader.RecentActions(s.opts.ActionsLimit)
 	if err != nil {
 		return indexData{}, err
 	}
@@ -158,8 +176,8 @@ func (s *Server) loadIndexData() (indexData, error) {
 		ControlEnabled: s.opts.Submit != nil,
 		Now:            time.Now(),
 		State:          s.opts.State(),
-		Sessions:       sessions,
-		Actions:        actions,
+		Blocks:         buildBlocks(sessions, sessionActions, recentActions),
+		LemmaryURL:     s.opts.LemmaryURL,
 	}, nil
 }
 
@@ -210,6 +228,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		Sessions:       sessions,
 		Actions:        actions,
 		ControlEnabled: s.opts.Submit != nil,
+		LemmaryURL:     s.opts.LemmaryURL,
 	})
 }
 
@@ -280,7 +299,7 @@ func actionFromRequest(r *http.Request) (session.Action, error) {
 	}
 
 	switch action := session.Action(r.FormValue("action")); action {
-	case session.ActionScanNew, session.ActionScanPage, session.ActionFinish:
+	case session.ActionScanNew, session.ActionScanPage, session.ActionFinish, session.ActionDiscard:
 		return action, nil
 	case "":
 		return "", errors.New("missing action")

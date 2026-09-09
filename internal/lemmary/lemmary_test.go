@@ -1,4 +1,4 @@
-package lemary_test
+package lemmary_test
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/oliverbestmann/scantool/internal/lemary"
+	"github.com/oliverbestmann/scantool/internal/lemmary"
 )
 
 func writeFile(t *testing.T, content string) string {
@@ -59,15 +59,21 @@ func TestUploadPostsMultipartFileWithAuth(t *testing.T) {
 		}
 		_ = params
 
+		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"id": "record-123", "processing_status": "pending"}`))
 	}))
 	defer server.Close()
 
-	client := &lemary.Client{BaseURL: server.URL, APIKey: "secret-key"}
+	client := &lemmary.Client{BaseURL: server.URL, APIKey: "secret-key"}
 	path := writeFile(t, "pdf-bytes")
 
-	if err := client.Upload(context.Background(), path); err != nil {
+	id, err := client.Upload(context.Background(), path)
+	if err != nil {
 		t.Fatalf("Upload: %v", err)
+	}
+	if id != "record-123" {
+		t.Fatalf("id = %q, want record-123", id)
 	}
 
 	if gotPath != "/api/upload" {
@@ -93,10 +99,10 @@ func TestUploadReturnsErrorOnNonSuccessStatus(t *testing.T) {
 	}))
 	defer server.Close()
 
-	client := &lemary.Client{BaseURL: server.URL, APIKey: "wrong-key"}
+	client := &lemmary.Client{BaseURL: server.URL, APIKey: "wrong-key"}
 	path := writeFile(t, "pdf-bytes")
 
-	if err := client.Upload(context.Background(), path); err == nil {
+	if _, err := client.Upload(context.Background(), path); err == nil {
 		t.Fatal("want error on 401, got nil")
 	}
 }
