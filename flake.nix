@@ -20,6 +20,7 @@
           scanPageRuntimeInputs = [
             pkgs.sane-backends
             pkgs.img2pdf
+            pkgs.imagemagick
           ];
 
           # Canon ScanGear MP v2 SANE backend (vendored proprietary blobs),

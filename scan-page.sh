@@ -26,9 +26,9 @@ mode="${SCAN_MODE:-Color}"
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
-image="$tmp/page.png"
+image="$tmp/page.pnm"
 
-set -- --format=png --resolution "$resolution" --mode "$mode"
+set -- --format=pnm --resolution "$resolution" --mode "$mode"
 [ -n "${SCAN_DEVICE:-}" ] && set -- "$@" --device-name "$SCAN_DEVICE"
 [ -n "${SCAN_SOURCE:-}" ] && set -- "$@" --source "$SCAN_SOURCE"
 
@@ -39,11 +39,6 @@ if [ ! -s "$image" ]; then
 	exit 1
 fi
 
-# img2pdf wraps the image without recompressing it, which keeps the scan sharp
-# and the file small.
-if ! command -v img2pdf > /dev/null 2>&1; then
-	echo "img2pdf not found, install it" >&2
-	exit 1
-fi
+magick convert -quality 95 -level 0%,90% "$image" "$image".jpg
 
-img2pdf --output "$dest" "$image"
+img2pdf --output "$dest" "$image".jpg
