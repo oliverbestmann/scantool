@@ -22,6 +22,13 @@
             pkgs.img2pdf
           ];
 
+          # Canon ScanGear MP v2 SANE backend (vendored proprietary blobs),
+          # for PIXMA/MAXIFY models unsupported by sane-backends' own pixma
+          # backend. Headless build has no GTK4/glib in its closure. Wire
+          # either into services.scantool.extraSaneBackends to use it.
+          scangearmp2Headless = pkgs.callPackage ./nix/packages/scangearmp2.nix { };
+          scangearmp2 = pkgs.callPackage ./nix/packages/scangearmp2.nix { withGui = true; };
+
           scantool = pkgs.buildGoModule {
             pname = "scantool";
             inherit version;
@@ -70,6 +77,8 @@
       }) // {
         overlays.default = final: prev: {
           scantool = self.packages.${final.system}.default;
+          scangearmp2Headless = self.packages.${final.system}.scangearmp2Headless;
+          scangearmp2 = self.packages.${final.system}.scangearmp2;
         };
 
         nixosModules.default = { pkgs, ... }: {

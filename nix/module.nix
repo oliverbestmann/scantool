@@ -5,6 +5,14 @@ let
 
   boolFlag = name: value: lib.optionals value [ "--${name}" ] ++ lib.optionals (!value) [ "--${name}=false" ];
 
+  # Merge sane-backends with any extra SANE backend packages into a single
+  # config/lib tree scanimage can use, see pkgs.mkSaneConfig.
+  saneConfig =
+    if cfg.extraSaneBackends == [ ] then
+      null
+    else
+      pkgs.mkSaneConfig { paths = [ pkgs.sane-backends ] ++ cfg.extraSaneBackends; };
+
   args =
     [ "--out" cfg.outDir ]
     ++ lib.optionals (cfg.workDir != null) [ "--work" cfg.workDir ]
@@ -114,6 +122,22 @@ in
       description = "Key source backend.";
     };
 
+    extraSaneBackends = lib.mkOption {
+      type = lib.types.listOf lib.types.package;
+      default = [ ];
+      example = lib.literalExpression "[ pkgs.scangearmp2Headless ]";
+      description = ''
+        Extra SANE backend packages to make available to `scanCommand`, on
+        top of `sane-backends`' own backends. Each package must provide
+        `lib/sane/libsane-*.so*` and `etc/sane.d/*` (see
+        `pkgs.mkSaneConfig`); they're merged and exposed to the service via
+        `SANE_CONFIG_DIR`/`LD_LIBRARY_PATH`, and their udev rules (if any)
+        are installed system-wide. Useful for scanners unsupported by
+        stock sane-backends, e.g. some Canon PIXMA/MAXIFY models via
+        `pkgs.scangearmp2Headless`.
+      '';
+    };
+
     device = lib.mkOption {
       type = lib.types.nullOr lib.types.str;
       default = null;
@@ -200,12 +224,17 @@ in
       scantool = { };
     };
 
+    services.udev.packages = cfg.extraSaneBackends;
+
     systemd.services.scantool = {
       description = "scantool, scan documents from a USB keypad";
       after = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
 
-      environment = cfg.environment;
+      environment = cfg.environment // lib.optionalAttrs (saneConfig != null) {
+        SANE_CONFIG_DIR = "${saneConfig}/etc/sane.d";
+        LD_LIBRARY_PATH = "${saneConfig}/lib/sane";
+      };
 
       serviceConfig = {
         Type = "exec";
