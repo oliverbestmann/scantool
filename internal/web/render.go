@@ -307,4 +307,15 @@ var templateFuncs = template.FuncMap{
 	"inc":          inc,
 	"base":         filepath.Base,
 	"lemmaryLink":  lemmaryLink,
+	"sumKB":        sumKB,
+}
+
+// sumKB adds up a session's per-page sizes for the status card's "Size"
+// field.
+func sumKB(sizes []int64) int64 {
+	var sum int64
+	for _, kb := range sizes {
+		sum += kb
+	}
+	return sum
 }

@@ -124,6 +124,7 @@ type State struct {
 	SessionID        int64     `json:"session_id,omitempty"`
 	SessionStartedAt time.Time `json:"session_started_at,omitzero"`
 	Pages            int       `json:"pages"`
+	PageSizesKB      []int64   `json:"page_sizes_kb,omitempty"`
 	LastError        string    `json:"last_error,omitempty"`
 	LastErrorAt      time.Time `json:"last_error_at,omitzero"`
 	LastSavedPath    string    `json:"last_saved_path,omitempty"`
@@ -251,6 +252,7 @@ func (m *Manager) recoverSession(sess store.Session) {
 	m.state.SessionID = sess.ID
 	m.state.SessionStartedAt = sess.StartedAt
 	m.state.Pages = len(paths)
+	m.state.PageSizesKB = pageSizesKB(paths)
 
 	log.Info("recovered active session", "pages", len(paths), "dir", dir)
 }
@@ -408,6 +410,7 @@ func (m *Manager) scan(ctx context.Context) error {
 	cur.pages = append(cur.pages, dest)
 	pages := len(cur.pages)
 	m.state.Pages = pages
+	m.state.PageSizesKB = append(m.state.PageSizesKB, pageSizeKB(dest))
 	m.state.Status = StatusIdle
 	m.state.Since = m.opts.Now()
 	m.state.LastError = ""
@@ -417,13 +420,33 @@ func (m *Manager) scan(ctx context.Context) error {
 	return nil
 }
 
+// pageSizeKB is the size of the page file at path, rounded up to the next
+// KB. A stat failure best-effort returns 0 rather than failing whatever
+// operation wanted the size.
+func pageSizeKB(path string) int64 {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0
+	}
+	return (info.Size() + 1023) / 1024
+}
+
+// pageSizesKB is pageSizeKB applied to every path, in order.
+func pageSizesKB(paths []string) []int64 {
+	sizes := make([]int64, len(paths))
+	for i, p := range paths {
+		sizes[i] = pageSizeKB(p)
+	}
+	return sizes
+}
+
 // pageScanDetail renders the action log detail line for a scanned page,
 // e.g. "142 KB, 1.8s". The file size is best effort: a stat failure just
 // drops it rather than failing the scan that already succeeded.
 func pageScanDetail(path string, elapsed time.Duration) string {
 	detail := fmt.Sprintf("%.1fs", elapsed.Seconds())
-	if info, err := os.Stat(path); err == nil {
-		detail = fmt.Sprintf("%d KB, %s", (info.Size()+1023)/1024, detail)
+	if size := pageSizeKB(path); size > 0 {
+		detail = fmt.Sprintf("%d KB, %s", size, detail)
 	}
 	return detail
 }
@@ -448,6 +471,7 @@ func (m *Manager) start() error {
 	m.state.SessionID = id
 	m.state.SessionStartedAt = now
 	m.state.Pages = 0
+	m.state.PageSizesKB = nil
 	m.mu.Unlock()
 
 	m.opts.Logger.Info("session started", "session", id, "dir", dir)
@@ -515,6 +539,7 @@ func (m *Manager) finish(ctx context.Context, upload bool) error {
 	m.state.SessionID = 0
 	m.state.SessionStartedAt = time.Time{}
 	m.state.Pages = 0
+	m.state.PageSizesKB = nil
 	m.state.Status = StatusIdle
 	m.state.Since = now
 	m.state.LastError = ""
@@ -577,15 +602,17 @@ func (m *Manager) upload(ctx context.Context, sessionID int64, path string, log 
 	kind := store.KindUploadSucceeded
 
 	lemmaryID, err := m.opts.Uploader.Upload(ctx, path)
+	detail := path
 	if err != nil {
 		log.Error("could not upload document", "error", err, "path", path)
 		status, errMsg = store.UploadFailed, err.Error()
 		kind = store.KindUploadFailed
 	} else {
 		log.Info("document uploaded", "path", path, "lemmary_id", lemmaryID)
+		detail = lemmaryID
 	}
 
-	action := store.Action{Kind: kind, SessionID: sessionID, Detail: path, Error: errMsg}
+	action := store.Action{Kind: kind, SessionID: sessionID, Detail: detail, Error: errMsg}
 	if err := m.opts.Recorder.RecordUploadWithAction(sessionID, status, lemmaryID, errMsg, action); err != nil {
 		log.Warn("could not record upload outcome", "error", err)
 	}
@@ -646,6 +673,7 @@ func (m *Manager) clear(status Status) {
 	m.state.SessionID = 0
 	m.state.SessionStartedAt = time.Time{}
 	m.state.Pages = 0
+	m.state.PageSizesKB = nil
 	m.state.Status = status
 	m.state.Since = now
 }

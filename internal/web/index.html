@@ -263,17 +263,21 @@ setInterval(refresh, 1000);
           <dd class="mb-1 tnum" id="f-pages">{{if .State.SessionActive}}{{.State.Pages}}{{else}}—{{end}}</dd>
         </div>
         <div class="col d-flex align-items-baseline gap-2">
+          <dt class="field-label text-body-secondary">Size</dt>
+          <dd class="mb-1 tnum" id="f-page-sizes">{{if .State.SessionActive}}{{sumKB .State.PageSizesKB}} KB{{else}}—{{end}}</dd>
+        </div>
+        <div class="col d-flex align-items-baseline gap-2">
           <dt class="field-label text-body-secondary text-nowrap">Last error</dt>
           <dd class="mb-1 detail{{if .State.LastError}} text-danger{{end}}" id="f-error">{{if .State.LastError}}{{.State.LastError}} ({{ago .State.LastErrorAt .Now}}){{else}}—{{end}}</dd>
         </div>
       </dl>
 
       {{if .ControlEnabled}}
+      <select class="form-select form-select-sm w-auto mt-3" id="dpi" aria-label="scan resolution" title="Resolution used for New/Add, from the web UI only">
+        <option value="300" selected>300 dpi</option>
+        <option value="600">600 dpi</option>
+      </select>
       <div class="d-flex flex-wrap align-items-center gap-2 mt-3" role="group" aria-label="scanner controls">
-        <select class="form-select form-select-sm w-auto" id="dpi" aria-label="scan resolution" title="Resolution used for New/Add, from the web UI only">
-          <option value="300" selected>300 dpi</option>
-          <option value="600">600 dpi</option>
-        </select>
         <button type="button" class="btn btn-primary action-btn" data-key="a"{{if $busy}} disabled{{end}}>New</button>
         <button type="button" class="btn btn-primary action-btn" data-key="b"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Add</button>
         <button type="button" class="btn btn-primary action-btn" data-key="c"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Finish</button>
@@ -304,9 +308,9 @@ setInterval(refresh, 1000);
           <span class="text-body-secondary small tnum">{{fmtDateTime .Session.StartedAt}}</span>
           <span class="text-body-secondary small tnum">{{pageCount .Session.Pages}}</span>
           <div class="ms-auto d-flex align-items-center gap-2">
+            {{with lemmaryLink $.LemmaryURL .Session.LemmaryID}}<a href="{{.}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" class="text-body-secondary" title="Open in lemmary" aria-label="Open in lemmary"><i class="bi bi-box-arrow-up-right"></i></a>{{end}}
             {{if .Session.OutputPath}}<a href="api/sessions/{{.Session.ID}}/download" onclick="event.stopPropagation()" class="text-body-secondary" title="Download {{base .Session.OutputPath}}" aria-label="Download {{base .Session.OutputPath}}"><i class="bi bi-download"></i></a>
             {{else if .Session.Error}}<i class="bi bi-exclamation-triangle text-danger" title="{{.Session.Error}}" aria-label="{{.Session.Error}}"></i>{{end}}
-            {{with lemmaryLink $.LemmaryURL .Session.LemmaryID}}<a href="{{.}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" class="text-body-secondary" title="Open in lemmary" aria-label="Open in lemmary"><i class="bi bi-box-arrow-up-right"></i></a>{{end}}
           </div>
         </summary>
         <div class="list-group list-group-flush">
