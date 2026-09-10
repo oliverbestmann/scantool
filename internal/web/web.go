@@ -109,6 +109,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/action", s.handleAction)
 	mux.HandleFunc("GET /api/sessions/{id}/download", s.handleDownload)
+	mux.HandleFunc("GET /api/thumbnail", s.handleThumbnail)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("ok\n"))
@@ -289,6 +290,28 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filepath.Base(sess.OutputPath)+`"`)
 	http.ServeFile(w, r, sess.OutputPath)
+}
+
+// handleThumbnail serves one page's thumbnail from the current session,
+// ?page=N being the 1-based page number shown in the status card. There is
+// nothing to show once a session finishes (State.Thumbnails is cleared along
+// with the rest of its per-session state), so a stale request from a browser
+// tab left open just gets a 404.
+func (s *Server) handleThumbnail(w http.ResponseWriter, r *http.Request) {
+	page, err := strconv.Atoi(r.FormValue("page"))
+	if err != nil || page < 1 {
+		s.fail(w, r, http.StatusBadRequest, errors.New("invalid page"))
+		return
+	}
+
+	thumbs := s.opts.State().Thumbnails
+	if page > len(thumbs) || thumbs[page-1] == "" {
+		s.fail(w, r, http.StatusNotFound, errors.New("no thumbnail available"))
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	http.ServeFile(w, r, thumbs[page-1])
 }
 
 // actionFromRequest accepts either ?action=scan-page or ?key=b.

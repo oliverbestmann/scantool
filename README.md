@@ -105,8 +105,11 @@ scantool scans a page itself: `scanimage --format=pnm` straight into memory,
 piped as `pnm:-` into `magick convert -quality 95 -level 0%,90%` to a JPEG,
 then `img2pdf` to wrap it into a single page PDF. The PNM buffer is
 preallocated from the expected width, height, resolution and mode instead of
-growing as scanimage writes to it. It is configured entirely through the
-environment:
+growing as scanimage writes to it. A second `magick convert` pass resizes
+that same JPEG down to a 200px wide thumbnail, stored next to the page; the
+web UI shows all of the open session's pages, newest first, served one by
+one from `/api/thumbnail?page=N`. It is
+configured entirely through the environment:
 
 | Variable          | Meaning                                  | Default              |
 |-------------------|-------------------------------------------|---------------------|

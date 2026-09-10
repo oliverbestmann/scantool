@@ -57,6 +57,24 @@
     max-width: 760px;
   }
 
+  /* The active session's scanned pages, newest first, scrolling
+     horizontally instead of pushing the status card taller. */
+  .thumbnail-strip {
+    display: flex;
+    gap: .5rem;
+    overflow-x: auto;
+    padding-bottom: .25rem;
+  }
+  .thumbnail {
+    flex: 0 0 auto;
+    max-width: 100px;
+    max-height: 140px;
+    object-fit: contain;
+    border: 1px solid var(--bs-border-color);
+    border-radius: .375rem;
+    background: var(--bs-body-bg);
+  }
+
   /* A session's card-header doubles as a <summary>: swap the default
      disclosure triangle for a chevron that rotates on open, and drop the
      marker's own list styling so it lines up with the rest of the header. */
@@ -271,6 +289,14 @@ setInterval(refresh, 1000);
           <dd class="mb-1 detail{{if .State.LastError}} text-danger{{end}}" id="f-error">{{if .State.LastError}}{{.State.LastError}} ({{ago .State.LastErrorAt .Now}}){{else}}—{{end}}</dd>
         </div>
       </dl>
+
+      {{if and .State.SessionActive (gt .State.Pages 0)}}
+      <div class="thumbnail-strip mt-3" id="thumbnails">
+        {{range pagesDesc .State.Pages}}
+        <img class="thumbnail" src="api/thumbnail?page={{.}}" alt="Page {{.}}">
+        {{end}}
+      </div>
+      {{end}}
 
       {{if .ControlEnabled}}
       <select class="form-select form-select-sm w-auto mt-3" id="dpi" aria-label="scan resolution" title="Resolution used for New/Add, from the web UI only">

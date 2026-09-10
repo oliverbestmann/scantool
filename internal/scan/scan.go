@@ -17,7 +17,15 @@ type Request struct {
 	// Resolution overrides the scanner's configured resolution, in dpi.
 	// Empty uses the scanner's own default.
 	Resolution string
+	// ThumbDest, if set, is the file the scanner must write a small JPEG
+	// thumbnail of the page to, besides the PDF at Dest.
+	ThumbDest string
 }
+
+// thumbnailWidth is the width, in pixels, of the thumbnail JPEG scanners
+// write alongside the page when Request.ThumbDest is set. Height follows
+// from the page's aspect ratio.
+const thumbnailWidth = 200
 
 // Scanner scans a single page.
 type Scanner interface {

@@ -72,6 +72,13 @@ func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
 		return fmt.Errorf("scan: convert: %w", err)
 	}
 
+	if req.ThumbDest != "" {
+		if err := s.runTool(ctx, s.cmd(s.MagickCmd, "magick"), nil,
+			"convert", jpg, "-resize", fmt.Sprintf("%dx", thumbnailWidth), "-quality", "85", req.ThumbDest); err != nil {
+			return fmt.Errorf("scan: thumbnail: %w", err)
+		}
+	}
+
 	if err := s.runTool(ctx, s.cmd(s.Img2pdfCmd, "img2pdf"), nil, "--output", req.Dest, jpg); err != nil {
 		os.Remove(req.Dest)
 		return fmt.Errorf("scan: img2pdf: %w", err)

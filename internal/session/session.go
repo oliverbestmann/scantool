@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -125,11 +126,16 @@ type State struct {
 	SessionStartedAt time.Time `json:"session_started_at,omitzero"`
 	Pages            int       `json:"pages"`
 	PageSizesKB      []int64   `json:"page_sizes_kb,omitempty"`
-	LastError        string    `json:"last_error,omitempty"`
-	LastErrorAt      time.Time `json:"last_error_at,omitzero"`
-	LastSavedPath    string    `json:"last_saved_path,omitempty"`
-	LastSavedPages   int       `json:"last_saved_pages,omitempty"`
-	LastSavedAt      time.Time `json:"last_saved_at,omitzero"`
+	// Thumbnails are the on-disk paths of the current session's page
+	// thumbnails, in scan order, served via /api/thumbnail?page=N. Not
+	// exposed in the JSON state: they're local filesystem paths, not
+	// something a client can use directly.
+	Thumbnails     []string  `json:"-"`
+	LastError      string    `json:"last_error,omitempty"`
+	LastErrorAt    time.Time `json:"last_error_at,omitzero"`
+	LastSavedPath  string    `json:"last_saved_path,omitempty"`
+	LastSavedPages int       `json:"last_saved_pages,omitempty"`
+	LastSavedAt    time.Time `json:"last_saved_at,omitzero"`
 }
 
 // Options configures a Manager.
@@ -253,6 +259,7 @@ func (m *Manager) recoverSession(sess store.Session) {
 	m.state.SessionStartedAt = sess.StartedAt
 	m.state.Pages = len(paths)
 	m.state.PageSizesKB = pageSizesKB(paths)
+	m.state.Thumbnails = thumbnailPaths(paths)
 
 	log.Info("recovered active session", "pages", len(paths), "dir", dir)
 }
@@ -375,6 +382,7 @@ func (m *Manager) scan(ctx context.Context) error {
 	cur := m.cur
 	page := len(cur.pages) + 1
 	dest := filepath.Join(cur.dir, fmt.Sprintf("page-%03d.pdf", page))
+	thumbDest := thumbPath(dest)
 
 	log := m.opts.Logger.With("session", cur.id, "page", page)
 	log.Info("scanning page")
@@ -382,7 +390,7 @@ func (m *Manager) scan(ctx context.Context) error {
 	m.setStatus(StatusScanning)
 
 	started := m.opts.Now()
-	req := scan.Request{Dest: dest, SessionID: cur.id, Page: page, Resolution: resolutionFromContext(ctx)}
+	req := scan.Request{Dest: dest, SessionID: cur.id, Page: page, Resolution: resolutionFromContext(ctx), ThumbDest: thumbDest}
 	if err := m.opts.Scanner.ScanPage(ctx, req); err != nil {
 		// The session stays open on purpose: pressing "b" retries the page
 		// without losing the pages scanned so far.
@@ -411,6 +419,11 @@ func (m *Manager) scan(ctx context.Context) error {
 	pages := len(cur.pages)
 	m.state.Pages = pages
 	m.state.PageSizesKB = append(m.state.PageSizesKB, pageSizeKB(dest))
+	if _, err := os.Stat(thumbDest); err == nil {
+		m.state.Thumbnails = append(m.state.Thumbnails, thumbDest)
+	} else {
+		m.state.Thumbnails = append(m.state.Thumbnails, "")
+	}
 	m.state.Status = StatusIdle
 	m.state.Since = m.opts.Now()
 	m.state.LastError = ""
@@ -438,6 +451,27 @@ func pageSizesKB(paths []string) []int64 {
 		sizes[i] = pageSizeKB(p)
 	}
 	return sizes
+}
+
+// thumbPath derives a page's thumbnail path from its PDF path, e.g.
+// "page-003.pdf" -> "page-003-thumb.jpg".
+func thumbPath(pagePath string) string {
+	return strings.TrimSuffix(pagePath, filepath.Ext(pagePath)) + "-thumb.jpg"
+}
+
+// thumbnailPaths derives each page's thumbnail path from paths, index
+// aligned so page N is Thumbnails[N-1] for /api/thumbnail?page=N; a missing
+// thumbnail (stat failure) leaves that slot empty. Used to rebuild
+// State.Thumbnails after a restart.
+func thumbnailPaths(paths []string) []string {
+	thumbs := make([]string, len(paths))
+	for i, p := range paths {
+		thumb := thumbPath(p)
+		if _, err := os.Stat(thumb); err == nil {
+			thumbs[i] = thumb
+		}
+	}
+	return thumbs
 }
 
 // pageScanDetail renders the action log detail line for a scanned page,
@@ -472,6 +506,7 @@ func (m *Manager) start() error {
 	m.state.SessionStartedAt = now
 	m.state.Pages = 0
 	m.state.PageSizesKB = nil
+	m.state.Thumbnails = nil
 	m.mu.Unlock()
 
 	m.opts.Logger.Info("session started", "session", id, "dir", dir)
@@ -540,6 +575,7 @@ func (m *Manager) finish(ctx context.Context, upload bool) error {
 	m.state.SessionStartedAt = time.Time{}
 	m.state.Pages = 0
 	m.state.PageSizesKB = nil
+	m.state.Thumbnails = nil
 	m.state.Status = StatusIdle
 	m.state.Since = now
 	m.state.LastError = ""
@@ -674,6 +710,7 @@ func (m *Manager) clear(status Status) {
 	m.state.SessionStartedAt = time.Time{}
 	m.state.Pages = 0
 	m.state.PageSizesKB = nil
+	m.state.Thumbnails = nil
 	m.state.Status = status
 	m.state.Since = now
 }

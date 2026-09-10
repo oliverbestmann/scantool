@@ -308,6 +308,17 @@ var templateFuncs = template.FuncMap{
 	"base":         filepath.Base,
 	"lemmaryLink":  lemmaryLink,
 	"sumKB":        sumKB,
+	"pagesDesc":    pagesDesc,
+}
+
+// pagesDesc returns the 1-based page numbers up to n in descending order, so
+// the thumbnail strip can show the newest page first.
+func pagesDesc(n int) []int {
+	pages := make([]int, n)
+	for i := range pages {
+		pages[i] = n - i
+	}
+	return pages
 }
 
 // sumKB adds up a session's per-page sizes for the status card's "Size"

@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"image"
 	"image/color"
+	"image/draw"
+	"image/jpeg"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -42,7 +44,34 @@ func (s *DevScanner) ScanPage(ctx context.Context, req Request) error {
 		return ctx.Err()
 	}
 
+	if req.ThumbDest != "" {
+		if err := writeBlankThumbnail(req.ThumbDest); err != nil {
+			return err
+		}
+	}
+
 	return writeBlankPDF(req.Dest)
+}
+
+// writeBlankThumbnail writes a small blank JPEG to dest, standing in for the
+// real scanner's resized page.
+func writeBlankThumbnail(dest string) error {
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return fmt.Errorf("scan: dev: create thumbnail directory: %w", err)
+	}
+
+	f, err := os.Create(dest)
+	if err != nil {
+		return fmt.Errorf("scan: dev: create thumbnail: %w", err)
+	}
+	defer f.Close()
+
+	img := image.NewRGBA(image.Rect(0, 0, thumbnailWidth, thumbnailWidth*141/100))
+	draw.Draw(img, img.Bounds(), &image.Uniform{C: color.White}, image.Point{}, draw.Src)
+	if err := jpeg.Encode(f, img, &jpeg.Options{Quality: 85}); err != nil {
+		return fmt.Errorf("scan: dev: encode thumbnail: %w", err)
+	}
+	return f.Close()
 }
 
 // writeBlankPDF creates a valid single-page PDF at dest, showing a plain
