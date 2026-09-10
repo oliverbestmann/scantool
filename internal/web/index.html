@@ -56,6 +56,27 @@
   #app {
     max-width: 760px;
   }
+
+  /* A session's card-header doubles as a <summary>: swap the default
+     disclosure triangle for a chevron that rotates on open, and drop the
+     marker's own list styling so it lines up with the rest of the header. */
+  summary.card-header {
+    cursor: pointer;
+    list-style: none;
+  }
+  summary.card-header::-webkit-details-marker {
+    display: none;
+  }
+  summary.card-header::before {
+    content: "\F285"; /* bootstrap-icons chevron-right */
+    font-family: bootstrap-icons, sans-serif;
+    font-size: .75rem;
+    color: var(--bs-secondary-color);
+    transition: transform .15s ease;
+  }
+  details[open] > summary.card-header::before {
+    transform: rotate(90deg);
+  }
 </style>
 </head>
 <body class="bg-body-tertiary">
@@ -111,10 +132,16 @@ async function refresh() {
     next.className = app.className;
     next.innerHTML = await res.text();
     morphdom(app, next, {
-      // The dpi dropdown has no server-side state to reflect back (the
-      // server always renders 300 dpi as selected); morphing it would
-      // reset the user's choice on every poll.
-      onBeforeElUpdated: (fromEl) => fromEl.id !== "dpi",
+      onBeforeElUpdated: (fromEl, toEl) => {
+        // The dpi dropdown has no server-side state to reflect back (the
+        // server always renders 300 dpi as selected); morphing it would
+        // reset the user's choice on every poll.
+        if (fromEl.id === "dpi") return false;
+        // Sessions collapse/expand client-side; keep whatever the user set
+        // instead of resetting it to the server's default on every poll.
+        if (fromEl.tagName === "DETAILS") toEl.open = fromEl.open;
+        return true;
+      },
     });
     maybeAutoDownload();
 
@@ -261,27 +288,31 @@ setInterval(refresh, 1000);
     {{range .Blocks}}
     {{if .System}}
     <div class="card mb-3" id="block-{{.ID}}">
-      <div class="card-header small fw-semibold text-body-secondary bg-body-tertiary">System</div>
-      <div class="list-group list-group-flush">
-        {{range .Actions}}{{template "actionItem" .}}{{end}}
-      </div>
+      <details>
+        <summary class="card-header small fw-semibold text-body-secondary bg-body-tertiary">System</summary>
+        <div class="list-group list-group-flush">
+          {{range .Actions}}{{template "actionItem" .}}{{end}}
+        </div>
+      </details>
     </div>
     {{else}}
     <div class="card mb-3" id="block-{{.ID}}">
-      <div class="card-header d-flex flex-wrap align-items-center gap-2">
-        <span class="fw-semibold">Session #{{.Session.ID}}</span>
-        <span class="badge rounded-pill {{sessionBadge .Session.Status}}">{{.Session.Status}}</span>
-        <span class="text-body-secondary small tnum">{{fmtDateTime .Session.StartedAt}}</span>
-        <span class="text-body-secondary small tnum">{{pageCount .Session.Pages}}</span>
-        <div class="ms-auto d-flex align-items-center gap-2">
-          {{if .Session.OutputPath}}<a href="api/sessions/{{.Session.ID}}/download" class="text-body-secondary" title="Download {{base .Session.OutputPath}}" aria-label="Download {{base .Session.OutputPath}}"><i class="bi bi-download"></i></a>
-          {{else if .Session.Error}}<i class="bi bi-exclamation-triangle text-danger" title="{{.Session.Error}}" aria-label="{{.Session.Error}}"></i>{{end}}
-          {{with lemmaryLink $.LemmaryURL .Session.LemmaryID}}<a href="{{.}}" target="_blank" rel="noopener" class="text-body-secondary" title="Open in lemmary" aria-label="Open in lemmary"><i class="bi bi-box-arrow-up-right"></i></a>{{end}}
+      <details{{if eq .Session.Status "active"}} open{{end}}>
+        <summary class="card-header d-flex flex-wrap align-items-center gap-2">
+          <span class="fw-semibold">Session #{{.Session.ID}}</span>
+          <span class="badge rounded-pill {{sessionBadge .Session.Status}}">{{.Session.Status}}</span>
+          <span class="text-body-secondary small tnum">{{fmtDateTime .Session.StartedAt}}</span>
+          <span class="text-body-secondary small tnum">{{pageCount .Session.Pages}}</span>
+          <div class="ms-auto d-flex align-items-center gap-2">
+            {{if .Session.OutputPath}}<a href="api/sessions/{{.Session.ID}}/download" onclick="event.stopPropagation()" class="text-body-secondary" title="Download {{base .Session.OutputPath}}" aria-label="Download {{base .Session.OutputPath}}"><i class="bi bi-download"></i></a>
+            {{else if .Session.Error}}<i class="bi bi-exclamation-triangle text-danger" title="{{.Session.Error}}" aria-label="{{.Session.Error}}"></i>{{end}}
+            {{with lemmaryLink $.LemmaryURL .Session.LemmaryID}}<a href="{{.}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" class="text-body-secondary" title="Open in lemmary" aria-label="Open in lemmary"><i class="bi bi-box-arrow-up-right"></i></a>{{end}}
+          </div>
+        </summary>
+        <div class="list-group list-group-flush">
+          {{range .Actions}}{{template "actionItem" .}}{{end}}
         </div>
-      </div>
-      <div class="list-group list-group-flush">
-        {{range .Actions}}{{template "actionItem" .}}{{end}}
-      </div>
+      </details>
     </div>
     {{end}}
     {{end}}
