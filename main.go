@@ -107,7 +107,7 @@ func run() error {
 		OutDir:     cfg.outDir,
 		WorkDir:    cfg.workDir,
 		FileLayout: cfg.fileLayout,
-		Scanner:    &scan.ShellScanner{Command: cfg.scanCmd, Timeout: cfg.scanTimeout},
+		Scanner:    newScanner(cfg),
 		Merger:     newMerger(cfg.mergeCmd),
 		Recorder:   db,
 		Uploader:   uploader,
@@ -167,10 +167,14 @@ func run() error {
 	sourceDone := make(chan error, 1)
 	go func() { sourceDone <- source.Run(ctx, keyCh) }()
 
+	scanCommand := cfg.scanCmd
+	if scanCommand == "" {
+		scanCommand = "built-in (scanimage/imagemagick/img2pdf)"
+	}
 	logger.Info("scantool started",
 		"input", source.Name(),
 		"out", cfg.outDir,
-		"scan_command", cfg.scanCmd,
+		"scan_command", scanCommand,
 		"http", cfg.httpAddr)
 	logger.Info("key bindings: a = new document, b = add page, c = finish document")
 
@@ -229,7 +233,8 @@ func parseFlags() config {
 	flag.StringVar(&cfg.outDir, "out", "scans", "directory for the finished PDF documents")
 	flag.StringVar(&cfg.workDir, "work", "", "directory for pages of open documents (default <out>/.scantool-work)")
 	flag.StringVar(&cfg.dbPath, "db", "", "SQLite database for sessions and the action log (default <out>/scantool.db)")
-	flag.StringVar(&cfg.scanCmd, "scan-command", "./scan-page.sh", "command scanning one page, called as <command> <output.pdf>")
+	flag.StringVar(&cfg.scanCmd, "scan-command", "", "external command scanning one page, called as <command> <output.pdf>; "+
+		"when unset, scantool scans pages itself via scanimage, imagemagick and img2pdf")
 	flag.DurationVar(&cfg.scanTimeout, "scan-timeout", 3*time.Minute, "abort a scan that takes longer than this")
 	flag.StringVar(&cfg.mergeCmd, "merge-command", "", "external merge command, e.g. \"pdfunite {{in}} {{out}}\" (default: built-in pdfcpu)")
 	flag.StringVar(&cfg.fileLayout, "name-layout", "20060102-150405", "Go time layout for the output file name")
@@ -281,6 +286,24 @@ func newUploader(cfg config) (session.Uploader, error) {
 		return nil, nil
 	}
 	return &lemary.Client{BaseURL: cfg.lemaryURL, APIKey: apiKey}, nil
+}
+
+// newScanner builds the page scanner. --scan-command opts into an external
+// script instead; otherwise scantool scans pages itself via the SANE,
+// imagemagick and img2pdf command line tools, configured through the
+// SCAN_DEVICE, SCAN_RESOLUTION, SCAN_MODE and SCAN_SOURCE environment
+// variables (the same ones the former scan-page.sh script read).
+func newScanner(cfg config) scan.Scanner {
+	if cfg.scanCmd != "" {
+		return &scan.ShellScanner{Command: cfg.scanCmd, Timeout: cfg.scanTimeout}
+	}
+	return &scan.SaneScanner{
+		Device:     os.Getenv("SCAN_DEVICE"),
+		Resolution: os.Getenv("SCAN_RESOLUTION"),
+		Mode:       os.Getenv("SCAN_MODE"),
+		Source:     os.Getenv("SCAN_SOURCE"),
+		Timeout:    cfg.scanTimeout,
+	}
 }
 
 func newMerger(command string) pdfmerge.Merger {

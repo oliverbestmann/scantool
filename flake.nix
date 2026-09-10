@@ -15,8 +15,8 @@
       in
       {
         packages = rec {
-          # Runtime tools scan-page.sh shells out to: scanimage from SANE, and
-          # img2pdf.
+          # Runtime tools the built-in scanner shells out to: scanimage from
+          # SANE, imagemagick and img2pdf.
           scanPageRuntimeInputs = [
             pkgs.sane-backends
             pkgs.img2pdf
@@ -51,8 +51,7 @@
             nativeBuildInputs = [ pkgs.makeWrapper ];
 
             postInstall = ''
-              install -Dm755 ${./scan-page.sh} $out/bin/scan-page.sh
-              wrapProgram $out/bin/scan-page.sh \
+              wrapProgram $out/bin/scantool \
                 --prefix PATH : ${pkgs.lib.makeBinPath scanPageRuntimeInputs}
             '';
 

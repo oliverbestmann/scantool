@@ -18,7 +18,6 @@ let
     ++ lib.optionals (cfg.workDir != null) [ "--work" cfg.workDir ]
     ++ lib.optionals (cfg.dbPath != null) [ "--db" cfg.dbPath ]
     ++ [
-      "--scan-command" cfg.scanCommand
       "--scan-timeout" cfg.scanTimeout
       "--name-layout" cfg.nameLayout
       "--input" cfg.input
@@ -27,6 +26,7 @@ let
       "--log-level" cfg.logLevel
       "--keep-actions" (toString cfg.keepActions)
     ]
+    ++ lib.optionals (cfg.scanCommand != null) [ "--scan-command" cfg.scanCommand ]
     ++ lib.optionals (cfg.mergeCommand != null) [ "--merge-command" cfg.mergeCommand ]
     ++ lib.optionals (cfg.device != null) [ "--device" cfg.device ]
     ++ boolFlag "web-control" cfg.webControl
@@ -93,10 +93,17 @@ in
     };
 
     scanCommand = lib.mkOption {
-      type = lib.types.str;
-      default = "${cfg.package}/bin/scan-page.sh";
-      defaultText = lib.literalExpression ''"''${config.services.scantool.package}/bin/scan-page.sh"'';
-      description = "Command scanning one page, called as `<command> <output.pdf>`.";
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "/path/to/custom-scan-page.sh";
+      description = ''
+        External command scanning one page, called as `<command>
+        <output.pdf>`. When unset (the default), scantool scans pages
+        itself via SANE's `scanimage`, imagemagick and `img2pdf`
+        (configured through `SCAN_DEVICE`, `SCAN_RESOLUTION`, `SCAN_MODE`
+        and `SCAN_SOURCE` in `environment`), so nothing extra needs to be
+        provided here.
+      '';
     };
 
     scanTimeout = lib.mkOption {
@@ -129,7 +136,7 @@ in
       default = [ ];
       example = lib.literalExpression "[ pkgs.scangearmp2Headless ]";
       description = ''
-        Extra SANE backend packages to make available to `scanCommand`, on
+        Extra SANE backend packages to make available to `scanimage`, on
         top of `sane-backends`' own backends. Each package must provide
         `lib/sane/libsane-*.so*` and `etc/sane.d/*` (see
         `pkgs.mkSaneConfig`); they're merged and exposed to the service via
@@ -193,9 +200,10 @@ in
         SCAN_MODE = "Color";
       };
       description = ''
-        Extra environment variables for the service, forwarded to the scan
-        command (e.g. `SCAN_RESOLUTION`, `SCAN_MODE`, `SCAN_DEVICE`,
-        `SCAN_SOURCE`, see `scan-page.sh`).
+        Extra environment variables for the service. The built-in scanner
+        (used unless `scanCommand` is set) reads `SCAN_RESOLUTION`,
+        `SCAN_MODE`, `SCAN_DEVICE` and `SCAN_SOURCE` from here; an external
+        `scanCommand` sees the same variables too.
       '';
     };
 

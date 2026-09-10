@@ -30,18 +30,20 @@ make pi32       # 32 bit Raspberry Pi OS  -> scantool-linux-arm
 ```
 
 Everything is pure Go — SQLite is `modernc.org/sqlite`, PDF merging is
-`pdfcpu` — so the cross builds need no C toolchain and the Pi needs no
-runtime dependencies beyond the scan script.
+`pdfcpu` — so the cross builds need no C toolchain. At runtime the daemon
+itself shells out to `scanimage`, `magick` and `img2pdf` to scan a page (see
+[Scanning a page](#scanning-a-page)), so those three need to be on `PATH`;
+the Nix package wraps the binary with them already.
 
 ## Running
 
 ```sh
-scantool --out /var/lib/scantool/scans --scan-command /usr/local/bin/scan-page.sh
+scantool --out /var/lib/scantool/scans
 ```
 
 The flake's NixOS module (`nixosModules.default`) runs it as its own user via
-systemd. The two things that matter there are group membership: `input` to
-read the keypad and `scanner`/`lp` to reach the scanner.
+systemd. The one thing that matters there is group membership: `input` to
+read the keypad and `lp` to reach the scanner.
 
 ```sh
 scantool --list-devices     # which keyboards the daemon can see
@@ -99,18 +101,23 @@ Two other backends exist:
 
 ### Scanning a page
 
-`scan-page.sh` is called once per page with the destination as its only
-argument, and must write a single page PDF there:
+By default scantool scans a page itself: `scanimage --format=pnm` into a
+temp file, `magick convert -quality 95 -level 0%,90%` to a JPEG, then
+`img2pdf` to wrap it into a single page PDF. It is configured entirely
+through the environment:
 
-```sh
-scan-page.sh /var/lib/scantool/scans/.scantool-work/session-4-xyz/page-002.pdf
-```
+| Variable          | Meaning                                  | Default              |
+|-------------------|-------------------------------------------|---------------------|
+| `SCAN_DEVICE`     | SANE device name, see `scanimage -L`      | scanimage's default |
+| `SCAN_RESOLUTION` | dpi                                        | `300`                |
+| `SCAN_MODE`       | `Color`, `Gray` or `Lineart`               | `Color`              |
+| `SCAN_SOURCE`     | e.g. `Flatbed` or `ADF`                    | scanimage's default |
 
-It also gets `SCANTOOL_DEST`, `SCANTOOL_SESSION` and `SCANTOOL_PAGE` in the
-environment. Anything it prints is kept and shown in the web UI when a scan
-fails. The bundled script drives `scanimage` and wraps the result with
-`img2pdf`; adjust it to your scanner, or point `--scan-command` somewhere
-else.
+`--scan-command <cmd>` replaces all of that with an external script, called
+once per page as `<cmd> <output.pdf>`, which must write a single page PDF to
+that path. It also gets `SCANTOOL_DEST`, `SCANTOOL_SESSION` and
+`SCANTOOL_PAGE` in the environment. Anything it prints is kept and shown in
+the web UI when a scan fails.
 
 A cancelled or timed out scan kills the whole process group, so a hanging
 `scanimage` cannot keep the scanner busy.
@@ -151,9 +158,9 @@ go test -race ./...
 
 The tests need neither a scanner nor a keyboard:
 
-* the scanner is a shell script that writes a file, so `scan-page.sh` and its
-  failure modes (bad exit code, no output, empty file, timeout, cancellation)
-  are covered without SANE;
+* the scanner's `scanimage`/`magick`/`img2pdf` calls are stand-in shell
+  scripts in tests, so its failure modes (bad exit code, no output, empty
+  file, timeout, cancellation) are covered without SANE;
 * the keypad is a FIFO that the evdev reader polls exactly like
   `/dev/input/eventN`, plus a pipe for the stdin backend;
 * the PDFs are real PDFs, generated with pdfcpu and validated after merging;
@@ -167,7 +174,7 @@ The tests need neither a scanner nor a keyboard:
 | `main.go`           | Flags, wiring, the action loop and shutdown          |
 | `internal/keys`     | Key sources: evdev, libinput, stdin                  |
 | `internal/session`  | The state machine behind `a`, `b` and `c`            |
-| `internal/scan`     | Running `scan-page.sh`                               |
+| `internal/scan`     | Scanning a page: built-in SANE scanner or `--scan-command` |
 | `internal/pdfmerge` | Merging pages into a document                        |
 | `internal/store`    | SQLite: sessions and the action log                  |
 | `internal/web`      | Status page and JSON API                             |

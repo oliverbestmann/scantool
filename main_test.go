@@ -280,6 +280,20 @@ func TestLoopReportsAFailingKeySource(t *testing.T) {
 	}
 }
 
+func TestNewScanner(t *testing.T) {
+	if _, ok := newScanner(config{}).(*scan.SaneScanner); !ok {
+		t.Error("empty scan-command should use the built-in SANE scanner")
+	}
+
+	shell, ok := newScanner(config{scanCmd: "/usr/local/bin/my-scan.sh"}).(*scan.ShellScanner)
+	if !ok {
+		t.Fatal("a scan-command should use the external scanner")
+	}
+	if shell.Command != "/usr/local/bin/my-scan.sh" {
+		t.Fatalf("shell.Command = %q", shell.Command)
+	}
+}
+
 func TestNewMerger(t *testing.T) {
 	if _, ok := newMerger("").(*pdfmerge.PDFCPU); !ok {
 		t.Error("empty command should use the built-in merger")
