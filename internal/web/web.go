@@ -64,7 +64,7 @@ func New(opts Options) (*Server, error) {
 		opts.Logger = slog.Default()
 	}
 
-	index, err := template.ParseFS(assets, "index.html")
+	index, err := template.New("index.html").Funcs(templateFuncs).ParseFS(assets, "index.html")
 	if err != nil {
 		return nil, fmt.Errorf("web: parse template: %w", err)
 	}
@@ -85,6 +85,7 @@ type snapshot struct {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /{$}", s.handleIndex)
+	mux.HandleFunc("GET /api/fragment", s.handleFragment)
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/action", s.handleAction)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -117,14 +118,65 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	return nil
 }
 
-func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+// indexData is the payload rendered by index.html. Its Actions/Sessions are
+// rendered into the same markup (same classes, same per-item ids) that the
+// polling JS produces from /api/state, so morphdom can diff the two without
+// tearing the DOM down on first refresh.
+type indexData struct {
+	ControlEnabled bool
+	Now            time.Time
+	State          session.State
+	Sessions       []store.Session
+	Actions        []store.Action
+}
 
-	data := map[string]any{
-		"ControlEnabled": s.opts.Submit != nil,
+// loadIndexData gathers the data shown on the page, shared by the full page
+// render and the /api/fragment poll.
+func (s *Server) loadIndexData() (indexData, error) {
+	sessions, err := s.opts.Reader.RecentSessions(s.opts.Limit)
+	if err != nil {
+		return indexData{}, err
 	}
-	if err := s.index.Execute(w, data); err != nil {
+
+	actions, err := s.opts.Reader.RecentActions(s.opts.Limit)
+	if err != nil {
+		return indexData{}, err
+	}
+
+	return indexData{
+		ControlEnabled: s.opts.Submit != nil,
+		Now:            time.Now(),
+		State:          s.opts.State(),
+		Sessions:       sessions,
+		Actions:        actions,
+	}, nil
+}
+
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	data, err := s.loadIndexData()
+	if err != nil {
+		s.fail(w, r, http.StatusInternalServerError, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.index.ExecuteTemplate(w, "index.html", data); err != nil {
 		s.opts.Logger.Warn("could not render index", "error", err)
+	}
+}
+
+// handleFragment renders just the dynamic "content" block, polled by the
+// page's JS and patched into the DOM with morphdom.
+func (s *Server) handleFragment(w http.ResponseWriter, r *http.Request) {
+	data, err := s.loadIndexData()
+	if err != nil {
+		s.fail(w, r, http.StatusInternalServerError, err)
+		return
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	if err := s.index.ExecuteTemplate(w, "content", data); err != nil {
+		s.opts.Logger.Warn("could not render fragment", "error", err)
 	}
 }
 

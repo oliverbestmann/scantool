@@ -30,6 +30,8 @@ let
     ++ lib.optionals (cfg.mergeCommand != null) [ "--merge-command" cfg.mergeCommand ]
     ++ lib.optionals (cfg.device != null) [ "--device" cfg.device ]
     ++ boolFlag "web-control" cfg.webControl
+    ++ lib.optionals (cfg.lemaryUrl != null) [ "--lemary-url" cfg.lemaryUrl ]
+    ++ lib.optionals (cfg.lemaryApiKeyFile != null) [ "--lemary-api-key-file" "%d/lemary-api-key" ]
     ++ cfg.extraArgs;
 in
 {
@@ -57,11 +59,11 @@ in
 
     extraGroups = lib.mkOption {
       type = lib.types.listOf lib.types.str;
-      default = [ "input" "scanner" "lp" ];
+      default = [ "input" "lp" ];
       description = ''
         Supplementary groups granted to the service: `input` to read the
-        keypad's `/dev/input/event*` nodes, `scanner`/`lp` to reach a USB or
-        network scanner.
+        keypad's `/dev/input/event*` nodes, `lp` to reach a USB or network
+        scanner.
       '';
     };
 
@@ -202,6 +204,27 @@ in
       default = [ ];
       description = "Extra command line arguments passed to scantool verbatim.";
     };
+
+    lemaryUrl = lib.mkOption {
+      type = lib.types.nullOr lib.types.str;
+      default = null;
+      example = "https://lemary.example.com";
+      description = ''
+        Lemary server to upload finished documents to. Requires
+        `lemaryApiKeyFile` to also be set.
+      '';
+    };
+
+    lemaryApiKeyFile = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      description = ''
+        Path to a file containing the lemary API key. Read at service start
+        via systemd's `LoadCredential=`, so the key ends up neither in the
+        Nix store nor in the unit's command line. Requires `lemaryUrl` to
+        also be set.
+      '';
+    };
   };
 
   config = lib.mkIf cfg.enable {
@@ -209,6 +232,10 @@ in
       {
         assertion = builtins.dirOf cfg.stateDir == "/var/lib";
         message = "services.scantool.stateDir must be a direct subdirectory of /var/lib, since it is created via systemd's StateDirectory=.";
+      }
+      {
+        assertion = (cfg.lemaryUrl == null) == (cfg.lemaryApiKeyFile == null);
+        message = "services.scantool.lemaryUrl and lemaryApiKeyFile must be set together.";
       }
     ];
 
@@ -247,6 +274,10 @@ in
         WorkingDirectory = cfg.stateDir;
 
         ExecStart = "${cfg.package}/bin/scantool ${lib.escapeShellArgs args}";
+
+        LoadCredential = lib.optionals (cfg.lemaryApiKeyFile != null) [
+          "lemary-api-key:${cfg.lemaryApiKeyFile}"
+        ];
 
         Restart = "always";
         RestartSec = "5s";

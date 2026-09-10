@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/oliverbestmann/scantool/internal/keys"
+	"github.com/oliverbestmann/scantool/internal/lemary"
 	"github.com/oliverbestmann/scantool/internal/pdfmerge"
 	"github.com/oliverbestmann/scantool/internal/scan"
 	"github.com/oliverbestmann/scantool/internal/session"
@@ -38,6 +39,10 @@ type config struct {
 	scanTimeout time.Duration
 	mergeCmd    string
 	fileLayout  string
+
+	lemaryURL        string
+	lemaryAPIKey     string
+	lemaryAPIKeyFile string
 
 	input   string
 	devices string
@@ -93,6 +98,11 @@ func run() error {
 		}
 	}
 
+	uploader, err := newUploader(cfg)
+	if err != nil {
+		return err
+	}
+
 	manager, err := session.New(session.Options{
 		OutDir:     cfg.outDir,
 		WorkDir:    cfg.workDir,
@@ -100,6 +110,7 @@ func run() error {
 		Scanner:    &scan.ShellScanner{Command: cfg.scanCmd, Timeout: cfg.scanTimeout},
 		Merger:     newMerger(cfg.mergeCmd),
 		Recorder:   db,
+		Uploader:   uploader,
 		Logger:     logger,
 	})
 	if err != nil {
@@ -223,6 +234,10 @@ func parseFlags() config {
 	flag.StringVar(&cfg.mergeCmd, "merge-command", "", "external merge command, e.g. \"pdfunite {{in}} {{out}}\" (default: built-in pdfcpu)")
 	flag.StringVar(&cfg.fileLayout, "name-layout", "20060102-150405", "Go time layout for the output file name")
 
+	flag.StringVar(&cfg.lemaryURL, "lemary-url", "", "lemary server to upload finished documents to, e.g. https://lemary.example.com")
+	flag.StringVar(&cfg.lemaryAPIKey, "lemary-api-key", "", "API key for the lemary server (required together with --lemary-url)")
+	flag.StringVar(&cfg.lemaryAPIKeyFile, "lemary-api-key-file", "", "path to a file containing the lemary API key, instead of --lemary-api-key")
+
 	flag.StringVar(&cfg.input, "input", "evdev", "key source: evdev, libinput or stdin")
 	flag.StringVar(&cfg.devices, "device", "", "comma separated input devices (default: all keyboards)")
 	flag.StringVar(&cfg.grab, "grab", "auto", "take exclusive control of the input devices (evdev only): auto, yes or no")
@@ -244,6 +259,28 @@ func newLogger(level string) (*slog.Logger, error) {
 		return nil, fmt.Errorf("invalid log level %q", level)
 	}
 	return slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})), nil
+}
+
+// newUploader builds the lemary uploader when both a URL and an API key are
+// configured. The key can come from a file (--lemary-api-key-file), so it
+// need not be passed on the command line where it would be world-readable
+// via /proc or process listings. Uploading is optional, so a nil
+// session.Uploader is returned when unconfigured, which disables the
+// feature entirely.
+func newUploader(cfg config) (session.Uploader, error) {
+	apiKey := cfg.lemaryAPIKey
+	if cfg.lemaryAPIKeyFile != "" {
+		content, err := os.ReadFile(cfg.lemaryAPIKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("read lemary API key: %w", err)
+		}
+		apiKey = strings.TrimSpace(string(content))
+	}
+
+	if cfg.lemaryURL == "" || apiKey == "" {
+		return nil, nil
+	}
+	return &lemary.Client{BaseURL: cfg.lemaryURL, APIKey: apiKey}, nil
 }
 
 func newMerger(command string) pdfmerge.Merger {

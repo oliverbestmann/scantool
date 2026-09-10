@@ -2,6 +2,7 @@ package session_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"os"
@@ -52,6 +53,26 @@ func (f *fakeScanner) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.requests)
+}
+
+// fakeUploader stands in for the lemary client.
+type fakeUploader struct {
+	mu    sync.Mutex
+	paths []string
+	err   error
+}
+
+func (f *fakeUploader) Upload(_ context.Context, path string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.paths = append(f.paths, path)
+	return f.err
+}
+
+func (f *fakeUploader) uploaded() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.paths...)
 }
 
 // fakeMerger concatenates the page files, so tests can assert both the number
@@ -641,11 +662,13 @@ func TestEndToEndProducesARealPDF(t *testing.T) {
 // brokenRecorder fails on everything except creating a session.
 type brokenRecorder struct{ session.Recorder }
 
-func (brokenRecorder) CreateSession(time.Time) (int64, error) { return 99, nil }
-func (brokenRecorder) SetSessionPages(int64, int) error       { return errors.New("db gone") }
-func (brokenRecorder) AppendAction(store.Action) error        { return errors.New("db gone") }
+func (brokenRecorder) CreateSessionWithAction(time.Time) (int64, error) { return 99, nil }
+func (brokenRecorder) AddPage(int64, int, string, store.Action) error   { return errors.New("db gone") }
+func (brokenRecorder) AppendAction(store.Action) error                  { return errors.New("db gone") }
+func (brokenRecorder) ActiveSession() (store.Session, error)            { return store.Session{}, sql.ErrNoRows }
+func (brokenRecorder) SessionPages(int64) ([]string, error)             { return nil, nil }
 
-func (brokenRecorder) FinishSession(int64, time.Time, string, string, string) error {
+func (brokenRecorder) FinishSessionWithAction(int64, time.Time, string, string, string, store.Action) error {
 	return errors.New("db gone")
 }
 
@@ -665,9 +688,11 @@ func TestScanningSurvivesABrokenDatabase(t *testing.T) {
 
 type failingRecorder struct{ session.Recorder }
 
-func (failingRecorder) CreateSession(time.Time) (int64, error) {
+func (failingRecorder) CreateSessionWithAction(time.Time) (int64, error) {
 	return 0, errors.New("disk is read only")
 }
+
+func (failingRecorder) ActiveSession() (store.Session, error) { return store.Session{}, sql.ErrNoRows }
 
 func TestSessionCannotStartWithoutRecorder(t *testing.T) {
 	h := newHarness(t, func(o *session.Options) { o.Recorder = failingRecorder{} })
@@ -681,6 +706,155 @@ func TestSessionCannotStartWithoutRecorder(t *testing.T) {
 	}
 	if state := h.manager.State(); state.Status != session.StatusError {
 		t.Fatalf("status = %q, want error", state.Status)
+	}
+}
+
+// TestRecoverActiveSessionAfterRestart verifies that a new Manager, backed
+// by the same database and work directory as a crashed one, picks up an
+// active session from the database rather than starting fresh: the database
+// is the source of truth, not the process.
+func TestRecoverActiveSessionAfterRestart(t *testing.T) {
+	h := newHarness(t, nil)
+	h.press('a', 'b')
+
+	state := h.manager.State()
+	if !state.SessionActive || state.Pages != 2 {
+		t.Fatalf("state = %+v, want an active session with 2 pages", state)
+	}
+
+	// Simulate a crash: build a new Manager against the same store and work
+	// directory without ever calling Close on the old one.
+	manager2, err := session.New(session.Options{
+		OutDir:   h.outDir,
+		WorkDir:  h.workDir,
+		Scanner:  h.scanner,
+		Merger:   h.merger,
+		Recorder: h.db,
+		Now:      h.clock,
+	})
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+
+	recovered := manager2.State()
+	if !recovered.SessionActive {
+		t.Fatal("recovered manager has no active session")
+	}
+	if recovered.SessionID != state.SessionID || recovered.Pages != 2 {
+		t.Fatalf("recovered state = %+v, want session %d with 2 pages", recovered, state.SessionID)
+	}
+
+	// The recovered session must behave like the original: finishing it
+	// stores exactly the pages that were scanned before the "crash".
+	if err := manager2.Do(t.Context(), session.ActionFinish); err != nil {
+		t.Fatalf("finish recovered session: %v", err)
+	}
+	if docs := h.documents(); len(docs) != 1 {
+		t.Fatalf("got %d documents, want 1", len(docs))
+	}
+}
+
+// TestRecoverActiveSessionWithoutWorkDirFailsIt verifies that a session
+// whose scratch directory is gone (e.g. the disk holding it was wiped) gets
+// recorded as failed instead of staying active in the database forever.
+func TestRecoverActiveSessionWithoutWorkDirFailsIt(t *testing.T) {
+	h := newHarness(t, nil)
+	h.press('a', 'b')
+
+	for _, dir := range h.workDirs() {
+		if err := os.RemoveAll(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	manager2, err := session.New(session.Options{
+		OutDir:   h.outDir,
+		WorkDir:  h.workDir,
+		Scanner:  h.scanner,
+		Merger:   h.merger,
+		Recorder: h.db,
+		Now:      h.clock,
+	})
+	if err != nil {
+		t.Fatalf("session.New: %v", err)
+	}
+
+	if state := manager2.State(); state.SessionActive {
+		t.Fatalf("state = %+v, want no active session", state)
+	}
+
+	sessions := h.sessions()
+	if len(sessions) != 1 || sessions[0].Status != store.StatusFailed {
+		t.Fatalf("sessions = %+v, want a single failed session", sessions)
+	}
+}
+
+// TestFinishUploadsTheDocumentAndRecordsSuccess verifies that a configured
+// Uploader receives the finished document and that the outcome is recorded
+// on the session, in the action log, and that the document is kept on disk
+// so a failed upload could be retried later.
+func TestFinishUploadsTheDocumentAndRecordsSuccess(t *testing.T) {
+	uploader := &fakeUploader{}
+	h := newHarness(t, func(o *session.Options) { o.Uploader = uploader })
+
+	h.press('a', 'b', 'c')
+
+	sessions := h.sessions()
+	if len(sessions) != 1 {
+		t.Fatalf("got %d sessions, want 1", len(sessions))
+	}
+	if sessions[0].UploadStatus != store.UploadUploaded {
+		t.Fatalf("upload_status = %q, want %q", sessions[0].UploadStatus, store.UploadUploaded)
+	}
+
+	docs := h.documents()
+	if len(docs) != 1 {
+		t.Fatalf("got %d documents, want 1", len(docs))
+	}
+	if got := uploader.uploaded(); len(got) != 1 || got[0] != docs[0] {
+		t.Fatalf("uploaded = %v, want [%s]", got, docs[0])
+	}
+
+	kinds := h.actionKinds()
+	if kinds[len(kinds)-1] != store.KindUploadSucceeded {
+		t.Fatalf("last action = %q, want %q", kinds[len(kinds)-1], store.KindUploadSucceeded)
+	}
+
+	// The document must still be on disk: a failed upload must be
+	// retryable, and this one did not even fail.
+	if _, err := os.Stat(docs[0]); err != nil {
+		t.Fatalf("document missing after upload: %v", err)
+	}
+}
+
+// TestFinishKeepsDocumentWhenUploadFails verifies that a failed upload does
+// not remove the document and is recorded as failed rather than silently
+// dropped.
+func TestFinishKeepsDocumentWhenUploadFails(t *testing.T) {
+	uploader := &fakeUploader{err: errors.New("server unreachable")}
+	h := newHarness(t, func(o *session.Options) { o.Uploader = uploader })
+
+	h.press('a', 'b', 'c')
+
+	docs := h.documents()
+	if len(docs) != 1 {
+		t.Fatalf("got %d documents, want 1", len(docs))
+	}
+	if _, err := os.Stat(docs[0]); err != nil {
+		t.Fatalf("document missing after failed upload: %v", err)
+	}
+
+	sessions := h.sessions()
+	if len(sessions) != 1 || sessions[0].UploadStatus != store.UploadFailed {
+		t.Fatalf("sessions = %+v, want a single session with upload_status %q", sessions, store.UploadFailed)
+	}
+	if sessions[0].UploadError == "" {
+		t.Fatal("upload_error was not recorded")
+	}
+
+	kinds := h.actionKinds()
+	if kinds[len(kinds)-1] != store.KindUploadFailed {
+		t.Fatalf("last action = %q, want %q", kinds[len(kinds)-1], store.KindUploadFailed)
 	}
 }
 

@@ -4,6 +4,8 @@ package session
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -59,11 +61,30 @@ func ActionForKey(key rune) (Action, bool) {
 }
 
 // Recorder persists sessions and the action log. *store.Store implements it.
+// Every method that changes more than one fact (a session plus its action
+// log entry) does so atomically, so the database never observes one without
+// the other.
 type Recorder interface {
-	CreateSession(startedAt time.Time) (int64, error)
-	SetSessionPages(id int64, pages int) error
-	FinishSession(id int64, endedAt time.Time, status, outputPath, errMsg string) error
+	CreateSessionWithAction(startedAt time.Time) (int64, error)
+	AddPage(sessionID int64, page int, path string, action store.Action) error
+	FinishSessionWithAction(id int64, endedAt time.Time, status, outputPath, errMsg string, action store.Action) error
+	// RecordUploadWithAction stores the outcome of uploading a session's
+	// document and appends the matching action, atomically.
+	RecordUploadWithAction(id int64, status, errMsg string, action store.Action) error
 	AppendAction(a store.Action) error
+	// ActiveSession returns the most recent session still marked active, so
+	// a restarted daemon can resume it instead of losing track of it. It
+	// returns sql.ErrNoRows if none is active.
+	ActiveSession() (store.Session, error)
+	// SessionPages returns the recorded page paths of a session, so a
+	// restarted daemon can rebuild its in-memory session from the database.
+	SessionPages(sessionID int64) ([]string, error)
+}
+
+// Uploader posts a finished document somewhere else, e.g. a lemary server.
+// *lemary.Client implements it.
+type Uploader interface {
+	Upload(ctx context.Context, path string) error
 }
 
 // State is a snapshot of the daemon for the web UI.
@@ -97,6 +118,10 @@ type Options struct {
 	Merger pdfmerge.Merger
 	// Recorder persists sessions and the action log. Optional.
 	Recorder Recorder
+	// Uploader posts a finished document to an external service. Optional;
+	// when set, every saved document is uploaded and the outcome recorded
+	// on the session.
+	Uploader Uploader
 	// Logger receives diagnostics for the service log. Defaults to
 	// slog.Default().
 	Logger *slog.Logger
@@ -159,7 +184,59 @@ func New(opts Options) (*Manager, error) {
 
 	m := &Manager{opts: opts}
 	m.state = State{Status: StatusIdle, Since: opts.Now()}
+
+	if sess, err := opts.Recorder.ActiveSession(); err == nil {
+		m.recoverSession(sess)
+	} else if !errors.Is(err, sql.ErrNoRows) {
+		opts.Logger.Warn("could not check for an active session to recover", "error", err)
+	}
+
 	return m, nil
+}
+
+// recoverSession rebuilds the in-memory session from the database after a
+// restart, so the daemon does not depend on process memory to know what it
+// was doing. If the on-disk work directory is gone, the session is recorded
+// as failed instead of staying active forever.
+func (m *Manager) recoverSession(sess store.Session) {
+	log := m.opts.Logger.With("session", sess.ID)
+
+	paths, err := m.opts.Recorder.SessionPages(sess.ID)
+	if err != nil {
+		log.Warn("could not load pages of active session", "error", err)
+	}
+
+	dir, err := m.findWorkDir(sess.ID)
+	if err != nil {
+		log.Warn("could not recover work directory of active session, marking it failed", "error", err)
+		finishErr := m.opts.Recorder.FinishSessionWithAction(sess.ID, m.opts.Now(), store.StatusFailed, "", "work directory lost across restart",
+			store.Action{Kind: store.KindSaveFailed, SessionID: sess.ID, Error: "work directory lost across restart"})
+		if finishErr != nil {
+			log.Warn("could not record lost session as failed", "error", finishErr)
+		}
+		return
+	}
+
+	m.cur = &activeSession{id: sess.ID, startedAt: sess.StartedAt, dir: dir, pages: paths}
+	m.state.SessionActive = true
+	m.state.SessionID = sess.ID
+	m.state.SessionStartedAt = sess.StartedAt
+	m.state.Pages = len(paths)
+
+	log.Info("recovered active session", "pages", len(paths), "dir", dir)
+}
+
+// findWorkDir locates the scratch directory of a session by the id encoded
+// in its name, since the directory itself is not persisted.
+func (m *Manager) findWorkDir(id int64) (string, error) {
+	matches, err := filepath.Glob(filepath.Join(m.opts.WorkDir, fmt.Sprintf("session-%d-*", id)))
+	if err != nil {
+		return "", fmt.Errorf("session: search work directory: %w", err)
+	}
+	if len(matches) == 0 {
+		return "", fmt.Errorf("session: no work directory for session %d", id)
+	}
+	return matches[0], nil
 }
 
 // State returns a snapshot of the current state.
@@ -197,7 +274,7 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 		// "a" while a session already holds pages behaves like "c" followed
 		// by "a": the previous document is stored first.
 		if m.hasPages() {
-			if err := m.finish(); err != nil {
+			if err := m.finish(ctx); err != nil {
 				return err
 			}
 		}
@@ -208,7 +285,7 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 		return m.scan(ctx)
 
 	case ActionFinish:
-		return m.finish()
+		return m.finish(ctx)
 
 	default:
 		return fmt.Errorf("session: unknown action %q", action)
@@ -220,7 +297,7 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 func (m *Manager) Close() error {
 	m.runMu.Lock()
 	defer m.runMu.Unlock()
-	return m.finish()
+	return m.finish(context.Background())
 }
 
 func (m *Manager) hasPages() bool {
@@ -262,6 +339,14 @@ func (m *Manager) scan(ctx context.Context) error {
 		return err
 	}
 
+	// The page is on disk; recording it and its action atomically keeps the
+	// database's page count and action log from ever disagreeing with each
+	// other, even though a recording failure itself must not lose the page
+	// that was already scanned.
+	if err := m.opts.Recorder.AddPage(cur.id, page, dest, store.Action{Kind: store.KindPageScanned, SessionID: cur.id, Page: page}); err != nil {
+		log.Warn("could not record scanned page", "error", err)
+	}
+
 	m.mu.Lock()
 	cur.pages = append(cur.pages, dest)
 	pages := len(cur.pages)
@@ -271,11 +356,6 @@ func (m *Manager) scan(ctx context.Context) error {
 	m.state.LastError = ""
 	m.mu.Unlock()
 
-	if err := m.opts.Recorder.SetSessionPages(cur.id, pages); err != nil {
-		log.Warn("could not record page count", "error", err)
-	}
-	m.record(store.Action{Kind: store.KindPageScanned, SessionID: cur.id, Page: page})
-
 	log.Info("page scanned", "pages", pages)
 	return nil
 }
@@ -284,7 +364,7 @@ func (m *Manager) scan(ctx context.Context) error {
 func (m *Manager) start() error {
 	now := m.opts.Now()
 
-	id, err := m.opts.Recorder.CreateSession(now)
+	id, err := m.opts.Recorder.CreateSessionWithAction(now)
 	if err != nil {
 		return fmt.Errorf("session: create: %w", err)
 	}
@@ -303,12 +383,11 @@ func (m *Manager) start() error {
 	m.mu.Unlock()
 
 	m.opts.Logger.Info("session started", "session", id, "dir", dir)
-	m.record(store.Action{Kind: store.KindSessionStarted, SessionID: id})
 	return nil
 }
 
 // finish stores the current session. Must be called with runMu held.
-func (m *Manager) finish() error {
+func (m *Manager) finish(ctx context.Context) error {
 	cur := m.cur
 	if cur == nil {
 		m.opts.Logger.Info("no active session to finish")
@@ -322,10 +401,11 @@ func (m *Manager) finish() error {
 	// failed first scan.
 	if len(cur.pages) == 0 {
 		log.Info("session discarded, no pages scanned")
-		if err := m.opts.Recorder.FinishSession(cur.id, now, store.StatusDiscarded, "", ""); err != nil {
+		err := m.opts.Recorder.FinishSessionWithAction(cur.id, now, store.StatusDiscarded, "", "",
+			store.Action{Kind: store.KindSessionDiscarded, SessionID: cur.id})
+		if err != nil {
 			log.Warn("could not record discarded session", "error", err)
 		}
-		m.record(store.Action{Kind: store.KindSessionDiscarded, SessionID: cur.id})
 		m.removeWork(cur, log)
 		m.clear(StatusIdle)
 		return nil
@@ -340,32 +420,32 @@ func (m *Manager) finish() error {
 	if err != nil {
 		// The scratch directory is kept so the pages can be recovered by hand.
 		log.Error("could not store session", "error", err, "pages_dir", cur.dir)
-		if recErr := m.opts.Recorder.FinishSession(cur.id, now, store.StatusFailed, "", err.Error()); recErr != nil {
+		recErr := m.opts.Recorder.FinishSessionWithAction(cur.id, now, store.StatusFailed, "", err.Error(),
+			store.Action{
+				Kind:      store.KindSaveFailed,
+				SessionID: cur.id,
+				Page:      len(cur.pages),
+				Detail:    cur.dir,
+				Error:     err.Error(),
+			})
+		if recErr != nil {
 			log.Warn("could not record failed session", "error", recErr)
 		}
-		m.record(store.Action{
-			Kind:      store.KindSaveFailed,
-			SessionID: cur.id,
-			Page:      len(cur.pages),
-			Detail:    cur.dir,
-			Error:     err.Error(),
-		})
 		m.clear(StatusError)
 		m.fail(err)
 		return err
 	}
 
-	if err := m.opts.Recorder.FinishSession(cur.id, now, store.StatusSaved, dest, ""); err != nil {
+	pages := len(cur.pages)
+	if err := m.opts.Recorder.FinishSessionWithAction(cur.id, now, store.StatusSaved, dest, "",
+		store.Action{Kind: store.KindSessionSaved, SessionID: cur.id, Page: pages, Detail: dest}); err != nil {
 		log.Warn("could not record finished session", "error", err)
 	}
 
-	pages := len(cur.pages)
-	m.record(store.Action{
-		Kind:      store.KindSessionSaved,
-		SessionID: cur.id,
-		Page:      pages,
-		Detail:    dest,
-	})
+	if m.opts.Uploader != nil {
+		m.upload(ctx, cur.id, dest, log)
+	}
+
 	m.removeWork(cur, log)
 
 	m.mu.Lock()
@@ -396,6 +476,27 @@ func (m *Manager) record(a store.Action) {
 	}
 	if err := m.opts.Recorder.AppendAction(a); err != nil {
 		m.opts.Logger.Warn("could not append to action log", "error", err, "kind", string(a.Kind))
+	}
+}
+
+// upload posts the finished document and records the outcome on the
+// session. The document stays on disk either way, so a failed upload can be
+// retried later.
+func (m *Manager) upload(ctx context.Context, sessionID int64, path string, log *slog.Logger) {
+	status, errMsg := store.UploadUploaded, ""
+	kind := store.KindUploadSucceeded
+
+	if err := m.opts.Uploader.Upload(ctx, path); err != nil {
+		log.Error("could not upload document", "error", err, "path", path)
+		status, errMsg = store.UploadFailed, err.Error()
+		kind = store.KindUploadFailed
+	} else {
+		log.Info("document uploaded", "path", path)
+	}
+
+	action := store.Action{Kind: kind, SessionID: sessionID, Detail: path, Error: errMsg}
+	if err := m.opts.Recorder.RecordUploadWithAction(sessionID, status, errMsg, action); err != nil {
+		log.Warn("could not record upload outcome", "error", err)
 	}
 }
 
@@ -460,8 +561,14 @@ func (m *Manager) clear(status Status) {
 
 type nopRecorder struct{}
 
-func (nopRecorder) CreateSession(time.Time) (int64, error) { return 0, nil }
-func (nopRecorder) SetSessionPages(int64, int) error       { return nil }
-func (nopRecorder) AppendAction(store.Action) error        { return nil }
+func (nopRecorder) CreateSessionWithAction(time.Time) (int64, error) { return 0, nil }
+func (nopRecorder) AddPage(int64, int, string, store.Action) error   { return nil }
+func (nopRecorder) AppendAction(store.Action) error                  { return nil }
+func (nopRecorder) SessionPages(int64) ([]string, error)             { return nil, nil }
+func (nopRecorder) ActiveSession() (store.Session, error)            { return store.Session{}, sql.ErrNoRows }
 
-func (nopRecorder) FinishSession(int64, time.Time, string, string, string) error { return nil }
+func (nopRecorder) FinishSessionWithAction(int64, time.Time, string, string, string, store.Action) error {
+	return nil
+}
+
+func (nopRecorder) RecordUploadWithAction(int64, string, string, store.Action) error { return nil }

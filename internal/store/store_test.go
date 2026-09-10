@@ -25,9 +25,9 @@ func TestSessionLifecycle(t *testing.T) {
 	db := open(t)
 
 	started := time.Date(2026, 9, 8, 11, 44, 0, 0, time.UTC)
-	id, err := db.CreateSession(started)
+	id, err := db.CreateSessionWithAction(started)
 	if err != nil {
-		t.Fatalf("CreateSession: %v", err)
+		t.Fatalf("CreateSessionWithAction: %v", err)
 	}
 
 	sess, err := db.Session(id)
@@ -44,13 +44,15 @@ func TestSessionLifecycle(t *testing.T) {
 		t.Fatalf("ended_at = %v, want nil", sess.EndedAt)
 	}
 
-	if err := db.SetSessionPages(id, 3); err != nil {
-		t.Fatalf("SetSessionPages: %v", err)
+	if err := db.AddPage(id, 3, "/work/page-003.pdf", store.Action{Kind: store.KindPageScanned, SessionID: id, Page: 3}); err != nil {
+		t.Fatalf("AddPage: %v", err)
 	}
 
 	ended := started.Add(90 * time.Second)
-	if err := db.FinishSession(id, ended, store.StatusSaved, "/scans/20260908-114400.pdf", ""); err != nil {
-		t.Fatalf("FinishSession: %v", err)
+	err = db.FinishSessionWithAction(id, ended, store.StatusSaved, "/scans/20260908-114400.pdf", "",
+		store.Action{Kind: store.KindSessionSaved, SessionID: id})
+	if err != nil {
+		t.Fatalf("FinishSessionWithAction: %v", err)
 	}
 
 	sess, err = db.Session(id)
@@ -82,7 +84,7 @@ func TestRecentSessionsIsNewestFirst(t *testing.T) {
 
 	base := time.Date(2026, 9, 8, 9, 0, 0, 0, time.UTC)
 	for i := range 5 {
-		if _, err := db.CreateSession(base.Add(time.Duration(i) * time.Minute)); err != nil {
+		if _, err := db.CreateSessionWithAction(base.Add(time.Duration(i) * time.Minute)); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -252,7 +254,7 @@ func TestReopenKeepsData(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := db.CreateSession(time.Now()); err != nil {
+	if _, err := db.CreateSessionWithAction(time.Now()); err != nil {
 		t.Fatal(err)
 	}
 	if err := db.Close(); err != nil {

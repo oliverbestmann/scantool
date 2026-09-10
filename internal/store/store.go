@@ -5,6 +5,7 @@ package store
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -16,6 +17,13 @@ const (
 	StatusSaved     = "saved"
 	StatusDiscarded = "discarded"
 	StatusFailed    = "failed"
+)
+
+// Upload status values, recorded on a session once it has been saved.
+const (
+	UploadNone     = ""
+	UploadUploaded = "uploaded"
+	UploadFailed   = "failed"
 )
 
 // Kind identifies what happened. Kinds are stable strings, the web UI maps
@@ -35,12 +43,14 @@ const (
 	KindSessionSaved     Kind = "session-saved"
 	KindSessionDiscarded Kind = "session-discarded"
 	KindSaveFailed       Kind = "save-failed"
+	KindUploadSucceeded  Kind = "upload-succeeded"
+	KindUploadFailed     Kind = "upload-failed"
 )
 
 // Failed reports whether the action describes something going wrong.
 func (k Kind) Failed() bool {
 	switch k {
-	case KindScanFailed, KindSaveFailed:
+	case KindScanFailed, KindSaveFailed, KindUploadFailed:
 		return true
 	default:
 		return false
@@ -49,13 +59,15 @@ func (k Kind) Failed() bool {
 
 // Session is one scan session, i.e. one resulting PDF document.
 type Session struct {
-	ID         int64      `json:"id"`
-	StartedAt  time.Time  `json:"started_at"`
-	EndedAt    *time.Time `json:"ended_at,omitempty"`
-	Pages      int        `json:"pages"`
-	Status     string     `json:"status"`
-	OutputPath string     `json:"output_path,omitempty"`
-	Error      string     `json:"error,omitempty"`
+	ID           int64      `json:"id"`
+	StartedAt    time.Time  `json:"started_at"`
+	EndedAt      *time.Time `json:"ended_at,omitempty"`
+	Pages        int        `json:"pages"`
+	Status       string     `json:"status"`
+	OutputPath   string     `json:"output_path,omitempty"`
+	Error        string     `json:"error,omitempty"`
+	UploadStatus string     `json:"upload_status,omitempty"`
+	UploadError  string     `json:"upload_error,omitempty"`
 }
 
 // Action is one entry of the action log.
@@ -77,13 +89,22 @@ type Action struct {
 
 const schema = `
 CREATE TABLE IF NOT EXISTS sessions (
-	id          INTEGER PRIMARY KEY AUTOINCREMENT,
-	started_at  TEXT NOT NULL,
-	ended_at    TEXT,
-	pages       INTEGER NOT NULL DEFAULT 0,
-	status      TEXT NOT NULL,
-	output_path TEXT NOT NULL DEFAULT '',
-	error       TEXT NOT NULL DEFAULT ''
+	id            INTEGER PRIMARY KEY AUTOINCREMENT,
+	started_at    TEXT NOT NULL,
+	ended_at      TEXT,
+	pages         INTEGER NOT NULL DEFAULT 0,
+	status        TEXT NOT NULL,
+	output_path   TEXT NOT NULL DEFAULT '',
+	error         TEXT NOT NULL DEFAULT '',
+	upload_status TEXT NOT NULL DEFAULT '',
+	upload_error  TEXT NOT NULL DEFAULT ''
+);
+
+CREATE TABLE IF NOT EXISTS pages (
+	session_id INTEGER NOT NULL,
+	page       INTEGER NOT NULL,
+	path       TEXT NOT NULL,
+	PRIMARY KEY (session_id, page)
 );
 
 CREATE TABLE IF NOT EXISTS actions (
@@ -102,6 +123,13 @@ CREATE INDEX IF NOT EXISTS actions_session ON actions (session_id);
 // Store is a SQLite backed persistence layer. It is safe for concurrent use.
 type Store struct {
 	db *sql.DB
+}
+
+// querier is satisfied by both *sql.DB and *sql.Tx, so the statement helpers
+// below work whether or not they run inside a transaction.
+type querier interface {
+	Exec(query string, args ...any) (sql.Result, error)
+	Query(query string, args ...any) (*sql.Rows, error)
 }
 
 // Open opens, and if needed creates, the database at path. Use ":memory:"
@@ -127,15 +155,78 @@ func Open(path string) (*Store, error) {
 		return nil, fmt.Errorf("store: create schema: %w", err)
 	}
 
+	if err := migrate(db); err != nil {
+		db.Close()
+		return nil, err
+	}
+
 	return &Store{db: db}, nil
+}
+
+// migrate adds columns introduced after the initial schema to databases
+// that predate them. CREATE TABLE IF NOT EXISTS does not update existing
+// tables, so new columns need an explicit, idempotent ALTER TABLE.
+func migrate(db *sql.DB) error {
+	columns := []string{
+		`ALTER TABLE sessions ADD COLUMN upload_status TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE sessions ADD COLUMN upload_error TEXT NOT NULL DEFAULT ''`,
+	}
+	for _, stmt := range columns {
+		if _, err := db.Exec(stmt); err != nil {
+			if strings.Contains(err.Error(), "duplicate column name") {
+				continue
+			}
+			return fmt.Errorf("store: migrate: %w", err)
+		}
+	}
+	return nil
 }
 
 // Close closes the underlying database.
 func (s *Store) Close() error { return s.db.Close() }
 
-// CreateSession inserts a new active session and returns its id.
-func (s *Store) CreateSession(startedAt time.Time) (int64, error) {
-	res, err := s.db.Exec(
+// withTx runs fn inside a transaction, committing on success and rolling
+// back on error or panic.
+func (s *Store) withTx(fn func(tx *sql.Tx) error) (err error) {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return fmt.Errorf("store: begin: %w", err)
+	}
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p)
+		}
+		if err != nil {
+			tx.Rollback()
+			return
+		}
+		err = tx.Commit()
+	}()
+
+	return fn(tx)
+}
+
+// CreateSessionWithAction inserts a new active session and appends the
+// corresponding action log entry in a single transaction, so a session
+// never exists without a matching "session started" record.
+func (s *Store) CreateSessionWithAction(startedAt time.Time) (int64, error) {
+	var id int64
+	err := s.withTx(func(tx *sql.Tx) error {
+		var err error
+		if id, err = insertSession(tx, startedAt); err != nil {
+			return err
+		}
+		return insertAction(tx, Action{Kind: KindSessionStarted, SessionID: id, Time: startedAt})
+	})
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+func insertSession(q querier, startedAt time.Time) (int64, error) {
+	res, err := q.Exec(
 		`INSERT INTO sessions (started_at, status) VALUES (?, ?)`,
 		formatTime(startedAt), StatusActive,
 	)
@@ -145,30 +236,97 @@ func (s *Store) CreateSession(startedAt time.Time) (int64, error) {
 	return res.LastInsertId()
 }
 
-// SetSessionPages records how many pages have been scanned into a session.
-func (s *Store) SetSessionPages(id int64, pages int) error {
-	if _, err := s.db.Exec(`UPDATE sessions SET pages = ? WHERE id = ?`, pages, id); err != nil {
-		return fmt.Errorf("store: update session pages: %w", err)
-	}
-	return nil
+// AddPage records a scanned page and appends the matching action, updating
+// the session's page count, all in one transaction.
+func (s *Store) AddPage(sessionID int64, page int, path string, action Action) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(
+			`INSERT INTO pages (session_id, page, path) VALUES (?, ?, ?)`,
+			sessionID, page, path,
+		); err != nil {
+			return fmt.Errorf("store: insert page: %w", err)
+		}
+		if _, err := tx.Exec(`UPDATE sessions SET pages = ? WHERE id = ?`, page, sessionID); err != nil {
+			return fmt.Errorf("store: update session pages: %w", err)
+		}
+		return insertAction(tx, action)
+	})
 }
 
-// FinishSession marks a session as finished with the given terminal status.
-func (s *Store) FinishSession(id int64, endedAt time.Time, status, outputPath, errMsg string) error {
-	_, err := s.db.Exec(
-		`UPDATE sessions SET ended_at = ?, status = ?, output_path = ?, error = ? WHERE id = ?`,
-		formatTime(endedAt), status, outputPath, errMsg, id,
-	)
+// SessionPages returns the recorded page file paths of a session, ordered by
+// page number.
+func (s *Store) SessionPages(sessionID int64) ([]string, error) {
+	rows, err := s.db.Query(`SELECT path FROM pages WHERE session_id = ? ORDER BY page`, sessionID)
 	if err != nil {
-		return fmt.Errorf("store: finish session: %w", err)
+		return nil, fmt.Errorf("store: query pages: %w", err)
 	}
-	return nil
+	defer rows.Close()
+
+	var out []string
+	for rows.Next() {
+		var path string
+		if err := rows.Scan(&path); err != nil {
+			return nil, fmt.Errorf("store: scan page: %w", err)
+		}
+		out = append(out, path)
+	}
+	return out, rows.Err()
+}
+
+// FinishSessionWithAction marks a session as finished with the given
+// terminal status and appends the matching action, in one transaction.
+func (s *Store) FinishSessionWithAction(id int64, endedAt time.Time, status, outputPath, errMsg string, action Action) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(
+			`UPDATE sessions SET ended_at = ?, status = ?, output_path = ?, error = ? WHERE id = ?`,
+			formatTime(endedAt), status, outputPath, errMsg, id,
+		); err != nil {
+			return fmt.Errorf("store: finish session: %w", err)
+		}
+		return insertAction(tx, action)
+	})
+}
+
+// RecordUploadWithAction stores the outcome of uploading a session's
+// document and appends the matching action, in one transaction.
+func (s *Store) RecordUploadWithAction(id int64, status, errMsg string, action Action) error {
+	return s.withTx(func(tx *sql.Tx) error {
+		if _, err := tx.Exec(
+			`UPDATE sessions SET upload_status = ?, upload_error = ? WHERE id = ?`,
+			status, errMsg, id,
+		); err != nil {
+			return fmt.Errorf("store: record upload: %w", err)
+		}
+		return insertAction(tx, action)
+	})
+}
+
+// ActiveSession returns the most recent session still marked active, so the
+// daemon can resume it after a restart. It returns sql.ErrNoRows if none is
+// active.
+func (s *Store) ActiveSession() (Session, error) {
+	rows, err := s.db.Query(`
+		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error
+		FROM sessions WHERE status = ? ORDER BY id DESC LIMIT 1`, StatusActive)
+	if err != nil {
+		return Session{}, fmt.Errorf("store: query active session: %w", err)
+	}
+	defer rows.Close()
+
+	sessions, err := scanSessions(rows)
+	if err != nil {
+		return Session{}, err
+	}
+	if len(sessions) == 0 {
+		return Session{}, sql.ErrNoRows
+	}
+	return sessions[0], nil
 }
 
 // Session loads a single session by id.
 func (s *Store) Session(id int64) (Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, started_at, ended_at, pages, status, output_path, error
+		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error
 		FROM sessions WHERE id = ?`, id)
 	if err != nil {
 		return Session{}, fmt.Errorf("store: query session: %w", err)
@@ -188,7 +346,7 @@ func (s *Store) Session(id int64) (Session, error) {
 // RecentSessions returns the newest sessions, most recent first.
 func (s *Store) RecentSessions(limit int) ([]Session, error) {
 	rows, err := s.db.Query(`
-		SELECT id, started_at, ended_at, pages, status, output_path, error
+		SELECT id, started_at, ended_at, pages, status, output_path, error, upload_status, upload_error
 		FROM sessions ORDER BY id DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, fmt.Errorf("store: query sessions: %w", err)
@@ -205,7 +363,7 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 			started string
 			ended   sql.NullString
 		)
-		if err := rows.Scan(&sess.ID, &started, &ended, &sess.Pages, &sess.Status, &sess.OutputPath, &sess.Error); err != nil {
+		if err := rows.Scan(&sess.ID, &started, &ended, &sess.Pages, &sess.Status, &sess.OutputPath, &sess.Error, &sess.UploadStatus, &sess.UploadError); err != nil {
 			return nil, fmt.Errorf("store: scan session: %w", err)
 		}
 
@@ -227,11 +385,18 @@ func scanSessions(rows *sql.Rows) ([]Session, error) {
 
 // AppendAction stores one entry of the action log. The ID field is ignored.
 func (s *Store) AppendAction(a Action) error {
+	if err := insertAction(s.db, a); err != nil {
+		return err
+	}
+	return nil
+}
+
+func insertAction(q querier, a Action) error {
 	if a.Time.IsZero() {
 		a.Time = time.Now()
 	}
 
-	_, err := s.db.Exec(
+	_, err := q.Exec(
 		`INSERT INTO actions (time, kind, session_id, page, detail, error)
 		 VALUES (?, ?, ?, ?, ?, ?)`,
 		formatTime(a.Time), string(a.Kind), a.SessionID, a.Page, a.Detail, a.Error,
