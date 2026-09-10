@@ -182,6 +182,41 @@ setInterval(refresh, 1000);
   </div>
 
   <div class="card mb-4">
+    <div class="card-header">Documents</div>
+    <div class="table-responsive">
+      <table class="table table-sm table-hover align-middle mb-0">
+        <thead>
+          <tr>
+            <th scope="col" class="text-end">#</th>
+            <th scope="col">Started</th>
+            <th scope="col" class="d-none d-sm-table-cell">Ended</th>
+            <th scope="col" class="text-end">Pages</th>
+            <th scope="col">Status</th>
+            <th scope="col">File</th>
+          </tr>
+        </thead>
+        <tbody id="sessions">
+          {{range .Sessions}}
+          <tr id="session-{{.ID}}">
+            <td class="text-end tnum">#{{.ID}}</td>
+            <td class="tnum text-nowrap"><div>{{fmtDate .StartedAt}}</div><div class="text-body-secondary">{{fmtClock .StartedAt}} Uhr</div></td>
+            <td class="tnum text-nowrap d-none d-sm-table-cell">{{if .EndedAt}}<div>{{fmtDate .EndedAt}}</div><div class="text-body-secondary">{{fmtClock .EndedAt}} Uhr</div>{{else}}—{{end}}</td>
+            <td class="text-end tnum">{{.Pages}}</td>
+            <td><span class="badge rounded-pill {{sessionBadge .Status}}">{{.Status}}</span></td>
+            <td class="detail small{{if .Error}} text-danger{{else}} text-body-secondary{{end}}">
+              {{if .OutputPath}}<a href="api/sessions/{{.ID}}/download">{{.OutputPath}}</a>{{else}}{{.Error}}{{end}}
+            </td>
+          </tr>
+          {{end}}
+        </tbody>
+      </table>
+    </div>
+    <div class="card-body text-body-secondary small{{if .Sessions}} d-none{{end}}" id="sessions-empty">
+      No documents scanned yet.
+    </div>
+  </div>
+
+  <div class="card">
     <div class="card-header">Action log</div>
     <div class="list-group list-group-flush" id="actions">
       {{range groupActions .Actions}}
@@ -205,39 +240,6 @@ setInterval(refresh, 1000);
     </div>
     <div class="card-body text-body-secondary small{{if .Actions}} d-none{{end}}" id="actions-empty">
       Nothing has happened yet.
-    </div>
-  </div>
-
-  <div class="card">
-    <div class="card-header">Documents</div>
-    <div class="table-responsive">
-      <table class="table table-sm table-hover align-middle mb-0">
-        <thead>
-          <tr>
-            <th scope="col" class="text-end">#</th>
-            <th scope="col">Started</th>
-            <th scope="col" class="d-none d-sm-table-cell">Ended</th>
-            <th scope="col" class="text-end">Pages</th>
-            <th scope="col">Status</th>
-            <th scope="col">File</th>
-          </tr>
-        </thead>
-        <tbody id="sessions">
-          {{range .Sessions}}
-          <tr id="session-{{.ID}}">
-            <td class="text-end tnum">#{{.ID}}</td>
-            <td class="tnum text-nowrap"><div>{{fmtDate .StartedAt}}</div><div class="text-body-secondary">{{fmtClock .StartedAt}} Uhr</div></td>
-            <td class="tnum text-nowrap d-none d-sm-table-cell">{{if .EndedAt}}<div>{{fmtDate .EndedAt}}</div><div class="text-body-secondary">{{fmtClock .EndedAt}} Uhr</div>{{else}}—{{end}}</td>
-            <td class="text-end tnum">{{.Pages}}</td>
-            <td><span class="badge rounded-pill {{sessionBadge .Status}}">{{.Status}}</span></td>
-            <td class="detail small{{if .Error}} text-danger{{else}} text-body-secondary{{end}}">{{or .OutputPath .Error}}</td>
-          </tr>
-          {{end}}
-        </tbody>
-      </table>
-    </div>
-    <div class="card-body text-body-secondary small{{if .Sessions}} d-none{{end}}" id="sessions-empty">
-      No documents scanned yet.
     </div>
   </div>
 

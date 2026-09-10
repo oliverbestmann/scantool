@@ -4,6 +4,7 @@ package web
 
 import (
 	"context"
+	"database/sql"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -11,6 +12,8 @@ import (
 	"html/template"
 	"log/slog"
 	"net/http"
+	"path/filepath"
+	"strconv"
 	"time"
 
 	"github.com/oliverbestmann/scantool/internal/session"
@@ -24,6 +27,8 @@ var assets embed.FS
 type Reader interface {
 	RecentSessions(limit int) ([]store.Session, error)
 	RecentActions(limit int) ([]store.Action, error)
+	// Session loads a single session by id, for downloading its document.
+	Session(id int64) (store.Session, error)
 }
 
 // Options configures the Server.
@@ -37,8 +42,10 @@ type Options struct {
 	// Submit queues an action triggered from the browser. When nil the page
 	// is read only.
 	Submit func(session.Action) error
-	// Limit is how many log entries and sessions to show. Defaults to 100.
+	// Limit is how many sessions (documents) to show. Defaults to 100.
 	Limit int
+	// ActionsLimit is how many action log entries to show. Defaults to 50.
+	ActionsLimit int
 	// Logger receives diagnostics. Defaults to slog.Default().
 	Logger *slog.Logger
 }
@@ -59,6 +66,9 @@ func New(opts Options) (*Server, error) {
 	}
 	if opts.Limit <= 0 {
 		opts.Limit = 100
+	}
+	if opts.ActionsLimit <= 0 {
+		opts.ActionsLimit = 50
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -88,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/fragment", s.handleFragment)
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/action", s.handleAction)
+	mux.HandleFunc("GET /api/sessions/{id}/download", s.handleDownload)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.Write([]byte("ok\n"))
@@ -138,7 +149,7 @@ func (s *Server) loadIndexData() (indexData, error) {
 		return indexData{}, err
 	}
 
-	actions, err := s.opts.Reader.RecentActions(s.opts.Limit)
+	actions, err := s.opts.Reader.RecentActions(s.opts.ActionsLimit)
 	if err != nil {
 		return indexData{}, err
 	}
@@ -187,7 +198,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	actions, err := s.opts.Reader.RecentActions(s.opts.Limit)
+	actions, err := s.opts.Reader.RecentActions(s.opts.ActionsLimit)
 	if err != nil {
 		s.fail(w, r, http.StatusInternalServerError, err)
 		return
@@ -223,6 +234,35 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 
 	s.opts.Logger.Info("action queued from web ui", "action", string(action), "remote", r.RemoteAddr)
 	writeJSON(w, http.StatusAccepted, map[string]string{"queued": string(action)})
+}
+
+// handleDownload serves a finished session's PDF as an attachment. Sessions
+// are looked up by id rather than taking a path from the request, so the
+// handler can only ever serve a file scantool itself produced and recorded.
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.fail(w, r, http.StatusBadRequest, errors.New("invalid session id"))
+		return
+	}
+
+	sess, err := s.opts.Reader.Session(id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			s.fail(w, r, http.StatusNotFound, errors.New("session not found"))
+		} else {
+			s.fail(w, r, http.StatusInternalServerError, err)
+		}
+		return
+	}
+
+	if sess.OutputPath == "" {
+		s.fail(w, r, http.StatusNotFound, errors.New("session has no document"))
+		return
+	}
+
+	w.Header().Set("Content-Disposition", `attachment; filename="`+filepath.Base(sess.OutputPath)+`"`)
+	http.ServeFile(w, r, sess.OutputPath)
 }
 
 // actionFromRequest accepts either ?action=scan-page or ?key=b.

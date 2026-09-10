@@ -1,12 +1,15 @@
 package web_test
 
 import (
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -20,10 +23,32 @@ type fakeReader struct {
 	sessions []store.Session
 	actions  []store.Action
 	err      error
+
+	sessionsLimit int
+	actionsLimit  int
 }
 
-func (f *fakeReader) RecentSessions(int) ([]store.Session, error) { return f.sessions, f.err }
-func (f *fakeReader) RecentActions(int) ([]store.Action, error)   { return f.actions, f.err }
+func (f *fakeReader) RecentSessions(limit int) ([]store.Session, error) {
+	f.sessionsLimit = limit
+	return f.sessions, f.err
+}
+
+func (f *fakeReader) RecentActions(limit int) ([]store.Action, error) {
+	f.actionsLimit = limit
+	return f.actions, f.err
+}
+
+func (f *fakeReader) Session(id int64) (store.Session, error) {
+	if f.err != nil {
+		return store.Session{}, f.err
+	}
+	for _, sess := range f.sessions {
+		if sess.ID == id {
+			return sess, nil
+		}
+	}
+	return store.Session{}, sql.ErrNoRows
+}
 
 func newServer(t *testing.T, opts web.Options) http.Handler {
 	t.Helper()
@@ -146,6 +171,92 @@ func TestStateEndpointReportsStoreErrors(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "database is locked") {
 		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+func TestActionLogDefaultsTo50Entries(t *testing.T) {
+	reader := &fakeReader{}
+	handler := newServer(t, web.Options{Reader: reader})
+
+	get(t, handler, "/")
+	if reader.actionsLimit != 50 {
+		t.Fatalf("actions limit = %d, want 50", reader.actionsLimit)
+	}
+	if reader.sessionsLimit != 100 {
+		t.Fatalf("sessions limit = %d, want 100 (unaffected by the action log limit)", reader.sessionsLimit)
+	}
+}
+
+func TestDocumentsListedBeforeActionLog(t *testing.T) {
+	handler := newServer(t, web.Options{})
+
+	body := get(t, handler, "/").Body.String()
+	docs := strings.Index(body, `id="sessions-empty"`)
+	actions := strings.Index(body, `id="actions-empty"`)
+	if docs == -1 || actions == -1 || docs > actions {
+		t.Fatalf("documents (%d) must come before the action log (%d)", docs, actions)
+	}
+}
+
+func TestDocumentsListLinksToDownload(t *testing.T) {
+	reader := &fakeReader{
+		sessions: []store.Session{{ID: 9, Status: store.StatusSaved, OutputPath: "/scans/20260908-114400.pdf", Pages: 2}},
+	}
+	handler := newServer(t, web.Options{Reader: reader})
+
+	body := get(t, handler, "/").Body.String()
+	if !strings.Contains(body, `href="api/sessions/9/download"`) {
+		t.Fatalf("page does not link to the download endpoint: %s", body)
+	}
+}
+
+func TestDownloadEndpointServesTheDocument(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "20260908-114400.pdf")
+	if err := os.WriteFile(path, []byte("%PDF-1.4 fake document"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	reader := &fakeReader{sessions: []store.Session{{ID: 9, Status: store.StatusSaved, OutputPath: path}}}
+	handler := newServer(t, web.Options{Reader: reader})
+
+	rec := get(t, handler, "/api/sessions/9/download")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "%PDF-1.4 fake document" {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+	if got := rec.Header().Get("Content-Disposition"); !strings.Contains(got, `filename="20260908-114400.pdf"`) {
+		t.Fatalf("content-disposition = %q", got)
+	}
+}
+
+func TestDownloadEndpointRejectsUnknownSession(t *testing.T) {
+	handler := newServer(t, web.Options{Reader: &fakeReader{}})
+
+	rec := get(t, handler, "/api/sessions/42/download")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestDownloadEndpointRejectsSessionWithoutDocument(t *testing.T) {
+	reader := &fakeReader{sessions: []store.Session{{ID: 3, Status: store.StatusDiscarded}}}
+	handler := newServer(t, web.Options{Reader: reader})
+
+	rec := get(t, handler, "/api/sessions/3/download")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+}
+
+func TestDownloadEndpointRejectsBadID(t *testing.T) {
+	handler := newServer(t, web.Options{Reader: &fakeReader{}})
+
+	rec := get(t, handler, "/api/sessions/not-a-number/download")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
 	}
 }
 
