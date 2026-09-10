@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"time"
 )
 
@@ -27,6 +29,12 @@ type SaneScanner struct {
 	// Source is passed as scanimage's --source, e.g. "Flatbed" or "ADF".
 	// Empty uses the scanner's default source.
 	Source string
+	// Width is passed as scanimage's -x, the scan area width in mm.
+	// Defaults to "210" (A4).
+	Width string
+	// Height is passed as scanimage's -y, the scan area height in mm.
+	// Defaults to "297" (A4).
+	Height string
 
 	// ScanimageCmd, MagickCmd and Img2pdfCmd name the executables to run.
 	// They default to "scanimage", "magick" and "img2pdf", resolved via
@@ -53,18 +61,18 @@ func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	pnm := filepath.Join(tmp, "page.pnm")
-	if err := s.scanImage(ctx, pnm); err != nil {
+	pnm, err := s.scanImage(ctx)
+	if err != nil {
 		return err
 	}
 
-	jpg := pnm + ".jpg"
-	if err := s.runTool(ctx, s.cmd(s.MagickCmd, "magick"),
-		"convert", "-quality", "95", "-level", "0%,90%", pnm, jpg); err != nil {
+	jpg := filepath.Join(tmp, "page.jpg")
+	if err := s.runTool(ctx, s.cmd(s.MagickCmd, "magick"), bytes.NewReader(pnm),
+		"convert", "-quality", "95", "-level", "0%,90%", "pnm:-", jpg); err != nil {
 		return fmt.Errorf("scan: convert: %w", err)
 	}
 
-	if err := s.runTool(ctx, s.cmd(s.Img2pdfCmd, "img2pdf"), "--output", req.Dest, jpg); err != nil {
+	if err := s.runTool(ctx, s.cmd(s.Img2pdfCmd, "img2pdf"), nil, "--output", req.Dest, jpg); err != nil {
 		os.Remove(req.Dest)
 		return fmt.Errorf("scan: img2pdf: %w", err)
 	}
@@ -81,18 +89,14 @@ func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
 	return nil
 }
 
-// scanImage runs scanimage, writing its raw PNM output to dest.
-func (s *SaneScanner) scanImage(ctx context.Context, dest string) error {
-	resolution := s.Resolution
-	if resolution == "" {
-		resolution = "300"
+// scanImage runs scanimage and returns its raw PNM output, read straight
+// into memory rather than through a temp file. The buffer is pre-sized from
+// the expected image dimensions so it rarely needs to grow.
+func (s *SaneScanner) scanImage(ctx context.Context) ([]byte, error) {
+	args := []string{
+		"--format=pnm", "--resolution", s.resolution(), "--mode", s.mode(),
+		"-x", s.width(), "-y", s.height(),
 	}
-	mode := s.Mode
-	if mode == "" {
-		mode = "Color"
-	}
-
-	args := []string{"--format=pnm", "--resolution", resolution, "--mode", mode}
 	if s.Device != "" {
 		args = append(args, "--device-name", s.Device)
 	}
@@ -100,40 +104,35 @@ func (s *SaneScanner) scanImage(ctx context.Context, dest string) error {
 		args = append(args, "--source", s.Source)
 	}
 
-	out, err := os.Create(dest)
-	if err != nil {
-		return fmt.Errorf("scan: create %s: %w", dest, err)
-	}
-	defer out.Close()
-
 	cmd := exec.CommandContext(ctx, s.cmd(s.ScanimageCmd, "scanimage"), args...)
 	setupProcessGroup(cmd)
-	cmd.Stdout = out
+
+	var stdout bytes.Buffer
+	stdout.Grow(s.estimatePNMSize())
+	cmd.Stdout = &stdout
 
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
 	if err := cmd.Run(); err != nil {
-		os.Remove(dest)
 		if ctx.Err() != nil {
-			return fmt.Errorf("scan: scanimage: %w%s", ctx.Err(), tail(stderr.String()))
+			return nil, fmt.Errorf("scan: scanimage: %w%s", ctx.Err(), tail(stderr.String()))
 		}
-		return fmt.Errorf("scan: scanimage: %w%s", err, tail(stderr.String()))
+		return nil, fmt.Errorf("scan: scanimage: %w%s", err, tail(stderr.String()))
 	}
 
-	info, err := os.Stat(dest)
-	if err != nil || info.Size() == 0 {
-		os.Remove(dest)
-		return fmt.Errorf("scan: scanimage produced an empty image%s", tail(stderr.String()))
+	if stdout.Len() == 0 {
+		return nil, fmt.Errorf("scan: scanimage produced an empty image%s", tail(stderr.String()))
 	}
-	return nil
+	return stdout.Bytes(), nil
 }
 
 // runTool runs one of the conversion tools, capturing combined output for
-// error messages.
-func (s *SaneScanner) runTool(ctx context.Context, name string, args ...string) error {
+// error messages. A nil stdin leaves the tool's stdin untouched.
+func (s *SaneScanner) runTool(ctx context.Context, name string, stdin io.Reader, args ...string) error {
 	cmd := exec.CommandContext(ctx, name, args...)
 	setupProcessGroup(cmd)
+	cmd.Stdin = stdin
 
 	var out bytes.Buffer
 	cmd.Stdout = &out
@@ -153,4 +152,42 @@ func (s *SaneScanner) cmd(configured, fallback string) string {
 		return configured
 	}
 	return fallback
+}
+
+func (s *SaneScanner) resolution() string { return orDefault(s.Resolution, "300") }
+func (s *SaneScanner) mode() string       { return orDefault(s.Mode, "Color") }
+func (s *SaneScanner) width() string      { return orDefault(s.Width, "210") }
+func (s *SaneScanner) height() string     { return orDefault(s.Height, "297") }
+
+func orDefault(configured, fallback string) string {
+	if configured != "" {
+		return configured
+	}
+	return fallback
+}
+
+// estimatePNMSize predicts the size of scanimage's PNM output from the
+// configured width, height and resolution, so the buffer that receives it
+// can be preallocated instead of growing one reallocation at a time. It pads
+// the estimate by 10% plus a small constant for the PNM header.
+func (s *SaneScanner) estimatePNMSize() int {
+	widthMM, _ := strconv.ParseFloat(s.width(), 64)
+	heightMM, _ := strconv.ParseFloat(s.height(), 64)
+	dpi, _ := strconv.ParseFloat(s.resolution(), 64)
+
+	widthPx := widthMM / 25.4 * dpi
+	heightPx := heightMM / 25.4 * dpi
+
+	var bytesPerPixel float64
+	switch s.mode() {
+	case "Gray":
+		bytesPerPixel = 1
+	case "Lineart":
+		bytesPerPixel = 1.0 / 8
+	default: // Color
+		bytesPerPixel = 3
+	}
+
+	size := widthPx * heightPx * bytesPerPixel
+	return int(size*1.1) + 64
 }

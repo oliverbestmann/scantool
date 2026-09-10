@@ -342,8 +342,9 @@ func newUploader(cfg config) (session.Uploader, error) {
 // newScanner builds the page scanner. --scan-command opts into an external
 // script instead; otherwise scantool scans pages itself via the SANE,
 // imagemagick and img2pdf command line tools, configured through the
-// SCAN_DEVICE, SCAN_RESOLUTION, SCAN_MODE and SCAN_SOURCE environment
-// variables (the same ones the former scan-page.sh script read).
+// SCAN_DEVICE, SCAN_RESOLUTION, SCAN_MODE, SCAN_SOURCE, SCAN_WIDTH and
+// SCAN_HEIGHT environment variables (the same ones the former scan-page.sh
+// script read, plus SCAN_WIDTH/SCAN_HEIGHT which default to A4).
 func newScanner(cfg config) scan.Scanner {
 	if cfg.devScanner {
 		return &scan.DevScanner{}
@@ -356,6 +357,8 @@ func newScanner(cfg config) scan.Scanner {
 		Resolution: os.Getenv("SCAN_RESOLUTION"),
 		Mode:       os.Getenv("SCAN_MODE"),
 		Source:     os.Getenv("SCAN_SOURCE"),
+		Width:      os.Getenv("SCAN_WIDTH"),
+		Height:     os.Getenv("SCAN_HEIGHT"),
 		Timeout:    cfg.scanTimeout,
 	}
 }

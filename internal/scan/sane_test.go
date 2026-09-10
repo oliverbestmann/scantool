@@ -33,8 +33,8 @@ func happyScanner(t *testing.T) *scan.SaneScanner {
 
 	scanimage := writeTool(t, dir, "scanimage", `echo "P6 fake pnm" `)
 	magick := writeTool(t, dir, "magick", `
-# args: convert -quality 95 -level 0%,90% <in> <out>
-cp "$6" "$7"
+# args: convert -quality 95 -level 0%,90% pnm:- <out>, image data on stdin
+cat > "$7"
 `)
 	img2pdf := writeTool(t, dir, "img2pdf", `
 # args: --output <dest> <in>
@@ -68,7 +68,7 @@ func TestSaneScannerWritesPage(t *testing.T) {
 func TestSaneScannerPassesResolutionModeDeviceSource(t *testing.T) {
 	dir := t.TempDir()
 	scanimage := writeTool(t, dir, "scanimage", `printf '%s' "$*" > "$dir/args"; echo "P6 fake pnm"`)
-	magick := writeTool(t, dir, "magick", `cp "$6" "$7"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
 	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
 
 	s := &scan.SaneScanner{
@@ -96,17 +96,69 @@ func TestSaneScannerPassesResolutionModeDeviceSource(t *testing.T) {
 		t.Fatal(err)
 	}
 	args := string(got)
-	for _, want := range []string{"--format=pnm", "--resolution 600", "--mode Gray", "--device-name epson2:libusb:001:002", "--source ADF"} {
+	for _, want := range []string{"--format=pnm", "--resolution 600", "--mode Gray", "--device-name epson2:libusb:001:002", "--source ADF", "-x 210", "-y 297"} {
 		if !strings.Contains(args, want) {
 			t.Fatalf("args = %q, want it to contain %q", args, want)
 		}
 	}
 }
 
+func TestSaneScannerPassesWidthHeight(t *testing.T) {
+	dir := t.TempDir()
+	scanimage := writeTool(t, dir, "scanimage", `printf '%s' "$*" > "$dir/args"; echo "P6 fake pnm"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
+	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
+
+	s := &scan.SaneScanner{
+		ScanimageCmd: scanimage,
+		MagickCmd:    magick,
+		Img2pdfCmd:   img2pdf,
+		Width:        "148",
+		Height:       "210",
+	}
+
+	os.Setenv("dir", dir)
+	defer os.Unsetenv("dir")
+
+	dest := filepath.Join(dir, "page.pdf")
+	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest}); err != nil {
+		t.Fatalf("ScanPage: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(dir, "args"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	args := string(got)
+	for _, want := range []string{"-x 148", "-y 210"} {
+		if !strings.Contains(args, want) {
+			t.Fatalf("args = %q, want it to contain %q", args, want)
+		}
+	}
+}
+
+func TestSaneScannerFeedsPNMToMagickViaStdin(t *testing.T) {
+	dir := t.TempDir()
+	scanimage := writeTool(t, dir, "scanimage", `printf 'P6 fake pnm'`)
+	magick := writeTool(t, dir, "magick", `
+# args: convert -quality 95 -level 0%,90% pnm:- <out>
+if [ "$6" != "pnm:-" ]; then echo "want pnm:- as input arg, got $6" >&2; exit 1; fi
+cat > "$7"
+`)
+	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
+
+	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
+
+	dest := filepath.Join(dir, "page.pdf")
+	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest}); err != nil {
+		t.Fatalf("ScanPage: %v", err)
+	}
+}
+
 func TestSaneScannerDefaultsResolutionAndMode(t *testing.T) {
 	dir := t.TempDir()
 	scanimage := writeTool(t, dir, "scanimage", `printf '%s' "$*" > "$dir/args"; echo "P6 fake pnm"`)
-	magick := writeTool(t, dir, "magick", `cp "$6" "$7"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
 	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
 
 	os.Setenv("dir", dir)
@@ -135,7 +187,7 @@ func TestSaneScannerDefaultsResolutionAndMode(t *testing.T) {
 func TestSaneScannerRejectsEmptyScanimageOutput(t *testing.T) {
 	dir := t.TempDir()
 	scanimage := writeTool(t, dir, "scanimage", `: > /dev/null`) // produces nothing on stdout
-	magick := writeTool(t, dir, "magick", `cp "$6" "$7"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
 	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
 
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
@@ -159,7 +211,7 @@ func TestSaneScannerReportsScanimageFailure(t *testing.T) {
 echo "scanimage: no SANE devices found" >&2
 exit 1
 `)
-	magick := writeTool(t, dir, "magick", `cp "$6" "$7"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
 	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
 
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
@@ -195,7 +247,7 @@ func TestSaneScannerReportsMagickFailure(t *testing.T) {
 func TestSaneScannerReportsImg2pdfFailure(t *testing.T) {
 	dir := t.TempDir()
 	scanimage := writeTool(t, dir, "scanimage", `echo "P6 fake pnm"`)
-	magick := writeTool(t, dir, "magick", `cp "$6" "$7"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
 	img2pdf := writeTool(t, dir, "img2pdf", `echo "img2pdf: broken jpeg" >&2; exit 1`)
 
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}

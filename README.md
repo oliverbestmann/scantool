@@ -101,9 +101,11 @@ Two other backends exist:
 
 ### Scanning a page
 
-By default scantool scans a page itself: `scanimage --format=pnm` into a
-temp file, `magick convert -quality 95 -level 0%,90%` to a JPEG, then
-`img2pdf` to wrap it into a single page PDF. It is configured entirely
+By default scantool scans a page itself: `scanimage --format=pnm` straight
+into memory, piped as `pnm:-` into `magick convert -quality 95 -level
+0%,90%` to a JPEG, then `img2pdf` to wrap it into a single page PDF. The PNM
+buffer is preallocated from the expected width, height, resolution and mode
+instead of growing as scanimage writes to it. It is configured entirely
 through the environment:
 
 | Variable          | Meaning                                  | Default              |
@@ -112,6 +114,8 @@ through the environment:
 | `SCAN_RESOLUTION` | dpi                                        | `300`                |
 | `SCAN_MODE`       | `Color`, `Gray` or `Lineart`               | `Color`              |
 | `SCAN_SOURCE`     | e.g. `Flatbed` or `ADF`                    | scanimage's default |
+| `SCAN_WIDTH`      | scan area width in mm, scanimage's `-x`    | `210` (A4)           |
+| `SCAN_HEIGHT`     | scan area height in mm, scanimage's `-y`   | `297` (A4)           |
 
 `--scan-command <cmd>` replaces all of that with an external script, called
 once per page as `<cmd> <output.pdf>`, which must write a single page PDF to
