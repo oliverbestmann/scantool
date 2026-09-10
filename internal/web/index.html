@@ -304,11 +304,11 @@ setInterval(refresh, 1000);
         <option value="600">600 dpi</option>
       </select>
       <div class="d-flex flex-wrap align-items-center gap-2 mt-3" role="group" aria-label="scanner controls">
-        <button type="button" class="btn btn-primary action-btn" data-key="a"{{if $busy}} disabled{{end}}>New</button>
+        <button type="button" class="btn btn-primary action-btn{{if .State.SessionActive}} d-none{{end}}" data-key="a"{{if $busy}} disabled{{end}}>New</button>
         <button type="button" class="btn btn-primary action-btn" data-key="b"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Add</button>
-        <button type="button" class="btn btn-primary action-btn" data-key="c"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Finish</button>
-        <button type="button" class="btn btn-outline-primary action-btn" data-action="finish-no-upload" data-download="1"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Finish (no upload)</button>
-        <button type="button" class="btn btn-danger action-btn ms-sm-auto" data-action="discard"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Discard</button>
+        <button type="button" class="btn btn-primary action-btn{{if eq .State.Pages 0}} d-none{{end}}" data-key="c"{{if $busy}} disabled{{end}}>Finish</button>
+        <button type="button" class="btn btn-outline-primary action-btn{{if eq .State.Pages 0}} d-none{{end}}" data-action="finish-no-upload" data-download="1"{{if $busy}} disabled{{end}}>Finish (no upload)</button>
+        <button type="button" class="btn btn-danger action-btn ms-sm-auto{{if eq .State.Pages 0}} d-none{{end}}" data-action="discard"{{if $busy}} disabled{{end}}>Discard</button>
       </div>
       {{end}}
     </div>

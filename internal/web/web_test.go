@@ -122,29 +122,29 @@ func TestIndexHidesControlsWhenDisabled(t *testing.T) {
 	}
 }
 
-func TestDiscardButtonIsDisabledWithoutASession(t *testing.T) {
+func TestDiscardButtonIsHiddenWithoutAPage(t *testing.T) {
 	handler := newServer(t, web.Options{
 		State:  func() session.State { return session.State{Status: session.StatusIdle} },
 		Submit: func(session.Action, string) error { return nil },
 	})
 
 	body := get(t, handler, "/").Body.String()
-	if !strings.Contains(body, `data-action="discard" disabled`) {
-		t.Fatalf("discard button should be disabled without an active session: %s", body)
+	if !strings.Contains(body, `ms-sm-auto d-none" data-action="discard"`) {
+		t.Fatalf("discard button should be hidden without a scanned page: %s", body)
 	}
 }
 
-func TestDiscardButtonIsEnabledWithASession(t *testing.T) {
+func TestDiscardButtonIsShownWithAPage(t *testing.T) {
 	handler := newServer(t, web.Options{
 		State: func() session.State {
-			return session.State{Status: session.StatusIdle, SessionActive: true, SessionID: 1}
+			return session.State{Status: session.StatusIdle, SessionActive: true, SessionID: 1, Pages: 1}
 		},
 		Submit: func(session.Action, string) error { return nil },
 	})
 
 	body := get(t, handler, "/").Body.String()
 	if !strings.Contains(body, `data-action="discard">Discard`) {
-		t.Fatalf("discard button should be enabled with an active session: %s", body)
+		t.Fatalf("discard button should be shown with a scanned page: %s", body)
 	}
 }
 
