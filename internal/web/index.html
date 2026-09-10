@@ -118,7 +118,7 @@ async function refresh() {
     });
     maybeAutoDownload();
 
-    conn.textContent = "updated " + new Date().toLocaleTimeString("de-DE", { hour12: false }) + " Uhr";
+    conn.textContent = "updated " + new Date().toLocaleTimeString("de-DE", { hour12: false });
     conn.className = "ms-auto small text-body-secondary";
   } catch (e) {
     conn.textContent = "disconnected (" + e.message + ")";
@@ -198,7 +198,7 @@ setInterval(refresh, 1000);
 <div class="list-group-item action-item" id="action-{{.ID}}">
   <div class="d-flex flex-wrap justify-content-between align-items-baseline gap-2 action-head">
     <span{{if .Error}} class="action-title text-danger fw-semibold"{{else}} class="action-title fw-semibold"{{end}}>{{actionTitle .}}</span>
-    <span class="action-caption tnum text-body-secondary">{{fmtClock .Time}} Uhr</span>
+    <span class="action-caption tnum text-body-secondary">{{fmtClock .Time}}</span>
   </div>
   {{if or .Error (actionDetail .) (actionMeta .)}}
   <div class="action-caption text-body-secondary mt-1">

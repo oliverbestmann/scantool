@@ -144,13 +144,13 @@ func fmtClock(v any) string {
 	return t.Local().Format("15:04")
 }
 
-// fmtDateTime renders t as "10.09.2026, 14:32 Uhr".
+// fmtDateTime renders t as "10.09.2026, 14:32".
 func fmtDateTime(v any) string {
 	t := asTime(v)
 	if t.IsZero() {
 		return "—"
 	}
-	return fmtDate(t) + ", " + fmtClock(t) + " Uhr"
+	return fmtDate(t) + ", " + fmtClock(t)
 }
 
 // ago renders how long ago t was, relative to now.
