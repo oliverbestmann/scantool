@@ -20,12 +20,15 @@ type Source interface {
 	Name() string
 }
 
-// send delivers a key unless ctx was cancelled first.
+// send delivers a key if out is ready to receive it right now, and discards
+// it otherwise (e.g. while the daemon is busy handling a previous key). It
+// reports false only when ctx was cancelled first.
 func send(ctx context.Context, out chan<- rune, key rune) bool {
 	select {
 	case out <- key:
-		return true
 	case <-ctx.Done():
 		return false
+	default:
 	}
+	return true
 }

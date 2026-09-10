@@ -224,13 +224,13 @@ setInterval(refresh, 1000);
       {{range .Actions}}
       <div class="list-group-item action-item" id="action-{{.ID}}">
         <div class="d-flex flex-wrap justify-content-between align-items-baseline gap-2 action-head">
-          <span{{if .Error}} class="text-danger fw-semibold"{{else}} class="fw-semibold"{{end}}>{{actionLabel .Kind}}</span>
+          <span{{if .Error}} class="text-danger fw-semibold"{{else}} class="fw-semibold"{{end}}>{{actionTitle .}}</span>
           <span class="action-caption tnum text-body-secondary">{{fmtClock .Time}} Uhr</span>
         </div>
-        {{if or .Error .Detail (actionMeta .)}}
+        {{if or .Error (actionDetail .) (actionMeta .)}}
         <div class="action-caption text-body-secondary mt-1">
-          {{if or .Error .Detail}}<span class="action-detail{{if .Error}} text-danger{{end}}">{{or .Error .Detail}}</span>{{end}}
-          {{if and (or .Error .Detail) (actionMeta .)}} · {{end}}
+          {{if or .Error (actionDetail .)}}<span class="action-detail{{if .Error}} text-danger{{end}}">{{or .Error (actionDetail .)}}</span>{{end}}
+          {{if and (or .Error (actionDetail .)) (actionMeta .)}} · {{end}}
           {{if actionMeta .}}<span>{{actionMeta .}}</span>{{end}}
         </div>
         {{end}}

@@ -3,25 +3,29 @@ package web
 import (
 	"fmt"
 	"html/template"
+	"path/filepath"
 	"time"
 
 	"github.com/oliverbestmann/scantool/internal/store"
 )
 
-// actionLabels mirrors the LABELS map in index.html's inline script; keep
-// both in sync when adding a new store.Kind.
+// actionLabels gives the base heading for each store.Kind. actionTitle folds
+// in extra detail (e.g. which key, which file) for kinds where the label
+// alone isn't informative enough.
 var actionLabels = map[store.Kind]string{
-	store.KindDaemonStarted:    "daemon started",
-	store.KindDaemonStopped:    "daemon stopped",
-	store.KindKeyPressed:       "key pressed",
-	store.KindKeyIgnored:       "key ignored",
-	store.KindWebAction:        "requested from web",
-	store.KindSessionStarted:   "session started",
-	store.KindPageScanned:      "page scanned",
-	store.KindScanFailed:       "scan failed",
-	store.KindSessionSaved:     "document stored",
-	store.KindSessionDiscarded: "session discarded",
-	store.KindSaveFailed:       "storing failed",
+	store.KindDaemonStarted:    "Daemon started",
+	store.KindDaemonStopped:    "Daemon stopped",
+	store.KindKeyPressed:       "Key pressed",
+	store.KindKeyIgnored:       "Key ignored",
+	store.KindWebAction:        "Requested from web",
+	store.KindSessionStarted:   "Session started",
+	store.KindPageScanned:      "Page scanned",
+	store.KindScanFailed:       "Scan failed",
+	store.KindSessionSaved:     "Document stored",
+	store.KindSessionDiscarded: "Session discarded",
+	store.KindSaveFailed:       "Storing failed",
+	store.KindUploadSucceeded:  "Document uploaded",
+	store.KindUploadFailed:     "Upload failed",
 }
 
 var statusBadgeClasses = map[string]string{
@@ -43,6 +47,42 @@ func actionLabel(k store.Kind) string {
 		return l
 	}
 	return string(k)
+}
+
+// actionTitle renders the bold heading for an action log entry. For kinds
+// whose Detail is a single self-explanatory value (which key, which file),
+// it's folded into the heading instead of repeated on the line below.
+func actionTitle(a store.Action) string {
+	switch a.Kind {
+	case store.KindKeyPressed, store.KindKeyIgnored, store.KindWebAction:
+		if a.Detail == "" {
+			return actionLabel(a.Kind)
+		}
+		return actionLabel(a.Kind) + ": " + a.Detail
+	case store.KindSessionSaved:
+		return fmt.Sprintf("%s: %s, %s", actionLabel(a.Kind), filepath.Base(a.Detail), pageCount(a.Page))
+	default:
+		return actionLabel(a.Kind)
+	}
+}
+
+// pageCount renders n as "1 page" or "N pages".
+func pageCount(n int) string {
+	if n == 1 {
+		return "1 page"
+	}
+	return fmt.Sprintf("%d pages", n)
+}
+
+// actionDetail renders the secondary detail line for an action log entry,
+// or "" when actionTitle already folded the detail into the heading.
+func actionDetail(a store.Action) string {
+	switch a.Kind {
+	case store.KindKeyPressed, store.KindKeyIgnored, store.KindWebAction, store.KindSessionSaved:
+		return ""
+	default:
+		return a.Detail
+	}
 }
 
 func statusBadge(status any) string {
@@ -126,13 +166,15 @@ func ago(t time.Time, now time.Time) string {
 func inc(n int) int { return n + 1 }
 
 // actionMeta renders the "session #.. · page .." line under an action item,
-// or "" when the action carries no session/page.
+// or "" when the action carries no session/page. For KindSessionSaved, Page
+// is the document's total page count, already shown by actionTitle, so it's
+// left out here to avoid repeating it.
 func actionMeta(a store.Action) string {
 	meta := ""
 	if a.SessionID != 0 {
 		meta = fmt.Sprintf("session #%d", a.SessionID)
 	}
-	if a.Page != 0 {
+	if a.Page != 0 && a.Kind != store.KindSessionSaved {
 		if meta != "" {
 			meta += " · "
 		}
@@ -176,6 +218,8 @@ var templateFuncs = template.FuncMap{
 	"fmtDateTime":  fmtDateTime,
 	"ago":          ago,
 	"actionLabel":  actionLabel,
+	"actionTitle":  actionTitle,
+	"actionDetail": actionDetail,
 	"statusBadge":  statusBadge,
 	"sessionBadge": sessionBadge,
 	"actionMeta":   actionMeta,

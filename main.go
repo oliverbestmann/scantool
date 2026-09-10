@@ -127,8 +127,9 @@ func run() error {
 	defer stop()
 
 	// Key presses and web requests both feed the single action loop, so only
-	// one scan runs at a time and presses during a scan are queued.
-	keyCh := make(chan rune, 32)
+	// one scan runs at a time. keyCh is unbuffered: presses that arrive while
+	// the loop is busy handling a previous one are discarded, not queued.
+	keyCh := make(chan rune)
 	actionCh := make(chan session.Action, 32)
 
 	var submit func(session.Action) error
