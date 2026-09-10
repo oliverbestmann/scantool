@@ -26,7 +26,6 @@ let
       "--log-level" cfg.logLevel
       "--keep-actions" (toString cfg.keepActions)
     ]
-    ++ lib.optionals (cfg.scanCommand != null) [ "--scan-command" cfg.scanCommand ]
     ++ lib.optionals (cfg.mergeCommand != null) [ "--merge-command" cfg.mergeCommand ]
     ++ lib.optionals (cfg.device != null) [ "--device" cfg.device ]
     ++ boolFlag "web-control" cfg.webControl
@@ -90,20 +89,6 @@ in
       type = lib.types.nullOr lib.types.str;
       default = null;
       description = "SQLite database for sessions and the action log. Defaults to `<outDir>/scantool.db`.";
-    };
-
-    scanCommand = lib.mkOption {
-      type = lib.types.nullOr lib.types.str;
-      default = null;
-      example = "/path/to/custom-scan-page.sh";
-      description = ''
-        External command scanning one page, called as `<command>
-        <output.pdf>`. When unset (the default), scantool scans pages
-        itself via SANE's `scanimage`, imagemagick and `img2pdf`
-        (configured through `SCAN_DEVICE`, `SCAN_RESOLUTION`, `SCAN_MODE`
-        and `SCAN_SOURCE` in `environment`), so nothing extra needs to be
-        provided here.
-      '';
     };
 
     scanTimeout = lib.mkOption {
@@ -200,10 +185,9 @@ in
         SCAN_MODE = "Color";
       };
       description = ''
-        Extra environment variables for the service. The built-in scanner
-        (used unless `scanCommand` is set) reads `SCAN_RESOLUTION`,
-        `SCAN_MODE`, `SCAN_DEVICE` and `SCAN_SOURCE` from here; an external
-        `scanCommand` sees the same variables too.
+        Extra environment variables for the service. The built-in SANE
+        scanner reads `SCAN_RESOLUTION`, `SCAN_MODE`, `SCAN_DEVICE` and
+        `SCAN_SOURCE` from here.
       '';
     };
 

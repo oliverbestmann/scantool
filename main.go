@@ -38,7 +38,6 @@ type config struct {
 	outDir      string
 	workDir     string
 	dbPath      string
-	scanCmd     string
 	scanTimeout time.Duration
 	devScanner  bool
 	mergeCmd    string
@@ -146,13 +145,13 @@ func run() error {
 	// discarded (dropped for keys, rejected with an error for the web), not
 	// queued.
 	keyCh := make(chan rune)
-	actionCh := make(chan session.Action)
+	actionCh := make(chan webAction)
 
-	var submit func(session.Action) error
+	var submit func(session.Action, string) error
 	if cfg.webControl {
-		submit = func(a session.Action) error {
+		submit = func(a session.Action, resolution string) error {
 			select {
-			case actionCh <- a:
+			case actionCh <- webAction{Action: a, Resolution: resolution}:
 				return nil
 			default:
 				return errors.New("scantool is busy, try again in a moment")
@@ -184,12 +183,9 @@ func run() error {
 	sourceDone := make(chan error, 1)
 	go func() { sourceDone <- source.Run(ctx, keyCh) }()
 
-	scanCommand := cfg.scanCmd
-	switch {
-	case cfg.devScanner:
+	scanCommand := "built-in (scanimage/imagemagick/img2pdf)"
+	if cfg.devScanner {
 		scanCommand = "dev (fake, no hardware)"
-	case scanCommand == "":
-		scanCommand = "built-in (scanimage/imagemagick/img2pdf)"
 	}
 	logger.Info("scantool started",
 		"input", source.Name(),
@@ -209,11 +205,18 @@ func run() error {
 	return err
 }
 
+// webAction is an action queued from the web UI, with its optional scan
+// resolution override.
+type webAction struct {
+	Action     session.Action
+	Resolution string
+}
+
 // loop runs actions one at a time until the context is cancelled or the key
 // source gives up. When idleTimeout is positive, a document that is still
 // open after that much inactivity is finished automatically, just like
 // pressing "c"; idleTimeout <= 0 disables this.
-func loop(ctx context.Context, manager *session.Manager, keyCh <-chan rune, actionCh <-chan session.Action, sourceDone <-chan error, logger *slog.Logger, idleTimeout time.Duration) error {
+func loop(ctx context.Context, manager *session.Manager, keyCh <-chan rune, actionCh <-chan webAction, sourceDone <-chan error, logger *slog.Logger, idleTimeout time.Duration) error {
 	var idleTimer *time.Timer
 	var idleC <-chan time.Time
 	if idleTimeout > 0 {
@@ -249,11 +252,12 @@ func loop(ctx context.Context, manager *session.Manager, keyCh <-chan rune, acti
 				logger.Debug("action failed", "error", err)
 			}
 
-		case action := <-actionCh:
+		case wa := <-actionCh:
 			if idleTimer != nil {
 				idleTimer.Reset(idleTimeout)
 			}
-			if err := manager.DoLogged(ctx, action, store.KindWebAction, string(action)); err != nil {
+			actionCtx := session.WithResolution(ctx, wa.Resolution)
+			if err := manager.DoLogged(actionCtx, wa.Action, store.KindWebAction, string(wa.Action)); err != nil {
 				logger.Debug("action failed", "error", err)
 			}
 
@@ -276,8 +280,6 @@ func parseFlags() config {
 	flag.StringVar(&cfg.outDir, "out", "scans", "directory for the finished PDF documents")
 	flag.StringVar(&cfg.workDir, "work", "", "directory for pages of open documents (default <out>/.scantool-work)")
 	flag.StringVar(&cfg.dbPath, "db", "", "SQLite database for sessions and the action log (default <out>/scantool.db)")
-	flag.StringVar(&cfg.scanCmd, "scan-command", "", "external command scanning one page, called as <command> <output.pdf>; "+
-		"when unset, scantool scans pages itself via scanimage, imagemagick and img2pdf")
 	flag.DurationVar(&cfg.scanTimeout, "scan-timeout", 3*time.Minute, "abort a scan that takes longer than this")
 	flag.BoolVar(&cfg.devScanner, "dev-scanner", false, "fake the scanner: wait 3s and produce a blank page instead of scanning, for development without hardware")
 	flag.StringVar(&cfg.mergeCmd, "merge-command", "", "external merge command, e.g. \"pdfunite {{in}} {{out}}\" (default: built-in pdfcpu)")
@@ -339,18 +341,15 @@ func newUploader(cfg config) (session.Uploader, error) {
 	return &lemmary.Client{BaseURL: cfg.lemmaryURL, APIKey: apiKey}, nil
 }
 
-// newScanner builds the page scanner. --scan-command opts into an external
-// script instead; otherwise scantool scans pages itself via the SANE,
-// imagemagick and img2pdf command line tools, configured through the
+// newScanner builds the page scanner: scantool scans pages itself via the
+// SANE, imagemagick and img2pdf command line tools, configured through the
 // SCAN_DEVICE, SCAN_RESOLUTION, SCAN_MODE, SCAN_SOURCE, SCAN_WIDTH and
 // SCAN_HEIGHT environment variables (the same ones the former scan-page.sh
-// script read, plus SCAN_WIDTH/SCAN_HEIGHT which default to A4).
+// script read, plus SCAN_WIDTH/SCAN_HEIGHT which default to A4). --dev-scanner
+// fakes it instead, for development without hardware.
 func newScanner(cfg config) scan.Scanner {
 	if cfg.devScanner {
 		return &scan.DevScanner{}
-	}
-	if cfg.scanCmd != "" {
-		return &scan.ShellScanner{Command: cfg.scanCmd, Timeout: cfg.scanTimeout}
 	}
 	return &scan.SaneScanner{
 		Device:     os.Getenv("SCAN_DEVICE"),

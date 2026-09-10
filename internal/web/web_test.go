@@ -98,7 +98,7 @@ func post(t *testing.T, handler http.Handler, path string) *httptest.ResponseRec
 }
 
 func TestIndexRenders(t *testing.T) {
-	handler := newServer(t, web.Options{Submit: func(session.Action) error { return nil }})
+	handler := newServer(t, web.Options{Submit: func(session.Action, string) error { return nil }})
 
 	rec := get(t, handler, "/")
 	if rec.Code != http.StatusOK {
@@ -125,7 +125,7 @@ func TestIndexHidesControlsWhenDisabled(t *testing.T) {
 func TestDiscardButtonIsDisabledWithoutASession(t *testing.T) {
 	handler := newServer(t, web.Options{
 		State:  func() session.State { return session.State{Status: session.StatusIdle} },
-		Submit: func(session.Action) error { return nil },
+		Submit: func(session.Action, string) error { return nil },
 	})
 
 	body := get(t, handler, "/").Body.String()
@@ -139,7 +139,7 @@ func TestDiscardButtonIsEnabledWithASession(t *testing.T) {
 		State: func() session.State {
 			return session.State{Status: session.StatusIdle, SessionActive: true, SessionID: 1}
 		},
-		Submit: func(session.Action) error { return nil },
+		Submit: func(session.Action, string) error { return nil },
 	})
 
 	body := get(t, handler, "/").Body.String()
@@ -166,7 +166,7 @@ func TestStateEndpoint(t *testing.T) {
 	handler := newServer(t, web.Options{
 		State:  func() session.State { return state },
 		Reader: reader,
-		Submit: func(session.Action) error { return nil },
+		Submit: func(session.Action, string) error { return nil },
 	})
 
 	rec := get(t, handler, "/api/state")
@@ -324,7 +324,7 @@ func TestDownloadEndpointRejectsBadID(t *testing.T) {
 func TestActionEndpointQueuesActions(t *testing.T) {
 	queued := make(chan session.Action, 4)
 	handler := newServer(t, web.Options{
-		Submit: func(a session.Action) error {
+		Submit: func(a session.Action, _ string) error {
 			queued <- a
 			return nil
 		},
@@ -351,7 +351,7 @@ func TestActionEndpointQueuesActions(t *testing.T) {
 }
 
 func TestActionEndpointRejectsBadRequests(t *testing.T) {
-	handler := newServer(t, web.Options{Submit: func(session.Action) error { return nil }})
+	handler := newServer(t, web.Options{Submit: func(session.Action, string) error { return nil }})
 
 	for _, path := range []string{
 		"/api/action",
@@ -367,7 +367,7 @@ func TestActionEndpointRejectsBadRequests(t *testing.T) {
 
 func TestActionEndpointReportsAFullQueue(t *testing.T) {
 	handler := newServer(t, web.Options{
-		Submit: func(session.Action) error { return errors.New("scantool is busy") },
+		Submit: func(session.Action, string) error { return errors.New("scantool is busy") },
 	})
 
 	rec := post(t, handler, "/api/action?key=b")
@@ -388,7 +388,7 @@ func TestActionEndpointIsForbiddenWithoutControl(t *testing.T) {
 }
 
 func TestActionEndpointRejectsGet(t *testing.T) {
-	handler := newServer(t, web.Options{Submit: func(session.Action) error { return nil }})
+	handler := newServer(t, web.Options{Submit: func(session.Action, string) error { return nil }})
 
 	if rec := get(t, handler, "/api/action?key=b"); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("status = %d, want 405", rec.Code)

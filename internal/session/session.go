@@ -30,10 +30,31 @@ const (
 	ActionScanPage Action = "scan-page"
 	// ActionFinish stores the current session as a PDF. Bound to "c".
 	ActionFinish Action = "finish"
+	// ActionFinishNoUpload stores the current session as a PDF like
+	// ActionFinish, but skips the uploader. Not bound to a key; only
+	// reachable from the web UI.
+	ActionFinishNoUpload Action = "finish-no-upload"
 	// ActionDiscard drops the current session without storing it, whether or
 	// not it holds pages. Not bound to a key; only reachable from the web UI.
 	ActionDiscard Action = "discard"
 )
+
+// resolutionCtxKey carries a per-request scan resolution override through
+// Do/DoLogged, e.g. the dpi chosen in the web UI. Key presses never set it,
+// so they keep scanning at the scanner's configured default.
+type resolutionCtxKey struct{}
+
+// WithResolution attaches a scan resolution override (in dpi, e.g. "600")
+// to ctx, applied to the next scan action performed with it. Empty uses the
+// scanner's own default.
+func WithResolution(ctx context.Context, dpi string) context.Context {
+	return context.WithValue(ctx, resolutionCtxKey{}, dpi)
+}
+
+func resolutionFromContext(ctx context.Context) string {
+	dpi, _ := ctx.Value(resolutionCtxKey{}).(string)
+	return dpi
+}
 
 // Status describes what the daemon is doing right now.
 type Status string
@@ -301,7 +322,7 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 		// "a" while a session already holds pages behaves like "c" followed
 		// by "a": the previous document is stored first.
 		if m.hasPages() {
-			if err := m.finish(ctx); err != nil {
+			if err := m.finish(ctx, true); err != nil {
 				return err
 			}
 		}
@@ -312,7 +333,10 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 		return m.scan(ctx)
 
 	case ActionFinish:
-		return m.finish(ctx)
+		return m.finish(ctx, true)
+
+	case ActionFinishNoUpload:
+		return m.finish(ctx, false)
 
 	case ActionDiscard:
 		return m.discard()
@@ -327,7 +351,7 @@ func (m *Manager) Do(ctx context.Context, action Action) error {
 func (m *Manager) Close() error {
 	m.runMu.Lock()
 	defer m.runMu.Unlock()
-	return m.finish(context.Background())
+	return m.finish(context.Background(), true)
 }
 
 func (m *Manager) hasPages() bool {
@@ -355,7 +379,9 @@ func (m *Manager) scan(ctx context.Context) error {
 
 	m.setStatus(StatusScanning)
 
-	if err := m.opts.Scanner.ScanPage(ctx, scan.Request{Dest: dest, SessionID: cur.id, Page: page}); err != nil {
+	started := m.opts.Now()
+	req := scan.Request{Dest: dest, SessionID: cur.id, Page: page, Resolution: resolutionFromContext(ctx)}
+	if err := m.opts.Scanner.ScanPage(ctx, req); err != nil {
 		// The session stays open on purpose: pressing "b" retries the page
 		// without losing the pages scanned so far.
 		log.Error("scan failed", "error", err)
@@ -373,7 +399,8 @@ func (m *Manager) scan(ctx context.Context) error {
 	// database's page count and action log from ever disagreeing with each
 	// other, even though a recording failure itself must not lose the page
 	// that was already scanned.
-	if err := m.opts.Recorder.AddPage(cur.id, page, dest, store.Action{Kind: store.KindPageScanned, SessionID: cur.id, Page: page}); err != nil {
+	detail := pageScanDetail(dest, m.opts.Now().Sub(started))
+	if err := m.opts.Recorder.AddPage(cur.id, page, dest, store.Action{Kind: store.KindPageScanned, SessionID: cur.id, Page: page, Detail: detail}); err != nil {
 		log.Warn("could not record scanned page", "error", err)
 	}
 
@@ -388,6 +415,17 @@ func (m *Manager) scan(ctx context.Context) error {
 
 	log.Info("page scanned", "pages", pages)
 	return nil
+}
+
+// pageScanDetail renders the action log detail line for a scanned page,
+// e.g. "142 KB, 1.8s". The file size is best effort: a stat failure just
+// drops it rather than failing the scan that already succeeded.
+func pageScanDetail(path string, elapsed time.Duration) string {
+	detail := fmt.Sprintf("%.1fs", elapsed.Seconds())
+	if info, err := os.Stat(path); err == nil {
+		detail = fmt.Sprintf("%d KB, %s", (info.Size()+1023)/1024, detail)
+	}
+	return detail
 }
 
 // start opens a new session. Must be called with runMu held.
@@ -416,8 +454,9 @@ func (m *Manager) start() error {
 	return nil
 }
 
-// finish stores the current session. Must be called with runMu held.
-func (m *Manager) finish(ctx context.Context) error {
+// finish stores the current session, uploading it when upload is true and an
+// Uploader is configured. Must be called with runMu held.
+func (m *Manager) finish(ctx context.Context, upload bool) error {
 	cur := m.cur
 	if cur == nil {
 		m.opts.Logger.Info("no active session to finish")
@@ -464,7 +503,7 @@ func (m *Manager) finish(ctx context.Context) error {
 		log.Warn("could not record finished session", "error", err)
 	}
 
-	if m.opts.Uploader != nil {
+	if upload && m.opts.Uploader != nil {
 		m.upload(ctx, cur.id, dest, log)
 	}
 

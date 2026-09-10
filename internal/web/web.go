@@ -43,9 +43,10 @@ type Options struct {
 	State func() session.State
 	// Reader provides sessions and the action log. Required.
 	Reader Reader
-	// Submit queues an action triggered from the browser. When nil the page
-	// is read only.
-	Submit func(session.Action) error
+	// Submit queues an action triggered from the browser, with an optional
+	// scan resolution override (dpi, e.g. "600"; empty uses the default).
+	// When nil the page is read only.
+	Submit func(action session.Action, resolution string) error
 	// LemmaryURL is the base URL of the lemmary server documents were
 	// uploaded to, used to link a session to its document there. Empty
 	// disables the link.
@@ -244,9 +245,15 @@ func (s *Server) handleAction(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	resolution, err := resolutionFromRequest(r)
+	if err != nil {
+		s.fail(w, r, http.StatusBadRequest, err)
+		return
+	}
+
 	// Queueing rather than running keeps the request fast: a scan takes
 	// seconds and runs on the daemon's action loop.
-	if err := s.opts.Submit(action); err != nil {
+	if err := s.opts.Submit(action, resolution); err != nil {
 		s.fail(w, r, http.StatusServiceUnavailable, err)
 		return
 	}
@@ -299,12 +306,24 @@ func actionFromRequest(r *http.Request) (session.Action, error) {
 	}
 
 	switch action := session.Action(r.FormValue("action")); action {
-	case session.ActionScanNew, session.ActionScanPage, session.ActionFinish, session.ActionDiscard:
+	case session.ActionScanNew, session.ActionScanPage, session.ActionFinish, session.ActionFinishNoUpload, session.ActionDiscard:
 		return action, nil
 	case "":
 		return "", errors.New("missing action")
 	default:
 		return "", fmt.Errorf("unknown action %q", action)
+	}
+}
+
+// resolutionFromRequest reads the optional dpi form value, e.g. set by the
+// web UI's dpi dropdown before a scan. Only the values the UI offers are
+// accepted; empty means the scanner's own default.
+func resolutionFromRequest(r *http.Request) (string, error) {
+	switch dpi := r.FormValue("dpi"); dpi {
+	case "", "300", "600":
+		return dpi, nil
+	default:
+		return "", fmt.Errorf("unsupported dpi %q", dpi)
 	}
 }
 

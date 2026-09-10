@@ -61,7 +61,7 @@ func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	pnm, err := s.scanImage(ctx)
+	pnm, err := s.scanImage(ctx, req.Resolution)
 	if err != nil {
 		return err
 	}
@@ -91,10 +91,17 @@ func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
 
 // scanImage runs scanimage and returns its raw PNM output, read straight
 // into memory rather than through a temp file. The buffer is pre-sized from
-// the expected image dimensions so it rarely needs to grow.
-func (s *SaneScanner) scanImage(ctx context.Context) ([]byte, error) {
+// the expected image dimensions so it rarely needs to grow. reqResolution
+// overrides the scanner's configured Resolution when set, e.g. per-request
+// from the web UI.
+func (s *SaneScanner) scanImage(ctx context.Context, reqResolution string) ([]byte, error) {
+	resolution := s.resolution()
+	if reqResolution != "" {
+		resolution = reqResolution
+	}
+
 	args := []string{
-		"--format=pnm", "--resolution", s.resolution(), "--mode", s.mode(),
+		"--format=pnm", "--resolution", resolution, "--mode", s.mode(),
 		"-x", s.width(), "-y", s.height(),
 	}
 	if s.Device != "" {

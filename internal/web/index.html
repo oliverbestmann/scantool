@@ -110,13 +110,41 @@ async function refresh() {
     next.id = app.id;
     next.className = app.className;
     next.innerHTML = await res.text();
-    morphdom(app, next);
+    morphdom(app, next, {
+      // The dpi dropdown has no server-side state to reflect back (the
+      // server always renders 300 dpi as selected); morphing it would
+      // reset the user's choice on every poll.
+      onBeforeElUpdated: (fromEl) => fromEl.id !== "dpi",
+    });
+    maybeAutoDownload();
 
     conn.textContent = "updated " + new Date().toLocaleTimeString("de-DE", { hour12: false }) + " Uhr";
     conn.className = "ms-auto small text-body-secondary";
   } catch (e) {
     conn.textContent = "disconnected (" + e.message + ")";
     conn.className = "ms-auto small text-danger";
+  }
+}
+
+// Set while waiting for a "Finish (no upload)" request to actually finish
+// the session, so the next refresh() that sees its document ready can start
+// the download automatically.
+let pendingDownloadSession = null;
+
+// Once a session's card shows a download link, click it to start the
+// browser download, then stop watching so it only fires once.
+function maybeAutoDownload() {
+  if (pendingDownloadSession === null) return;
+
+  const card = el("status-card");
+  if (card && card.dataset.sessionId == pendingDownloadSession) return; // still that session, not finished yet
+
+  const link = document.querySelector(
+    '#block-session-' + pendingDownloadSession + ' a[href*="/download"]'
+  );
+  if (link) {
+    pendingDownloadSession = null;
+    link.click();
   }
 }
 
@@ -131,17 +159,31 @@ document.addEventListener("click", async (e) => {
   const buttons = document.querySelectorAll("button[data-key], button[data-action]");
   buttons.forEach((b) => (b.disabled = true));
   try {
-    const query = button.dataset.key
+    let query = button.dataset.key
       ? "key=" + encodeURIComponent(button.dataset.key)
       : "action=" + encodeURIComponent(button.dataset.action);
+
+    // Only New/Add (key a/b) scan a page; dpi is a web-only override, so
+    // keyboard input keeps using the scanner's default.
+    if (button.dataset.key === "a" || button.dataset.key === "b") {
+      query += "&dpi=" + encodeURIComponent(el("dpi").value);
+    }
+
+    if (button.dataset.download) {
+      const card = el("status-card");
+      pendingDownloadSession = card ? card.dataset.sessionId : null;
+    }
+
     const res = await fetch("api/action?" + query, { method: "POST" });
     if (!res.ok) {
       const body = await res.json().catch(() => ({}));
       complain(body.error || "request failed with HTTP " + res.status);
+      pendingDownloadSession = null;
     }
     await refresh();
   } catch (e) {
     complain(e.message);
+    pendingDownloadSession = null;
     buttons.forEach((b) => (b.disabled = false));
   }
 });
@@ -170,7 +212,7 @@ setInterval(refresh, 1000);
 
 {{define "content"}}
   {{$busy := or (eq .State.Status "scanning") (eq .State.Status "saving")}}
-  <div class="card mb-4">
+  <div class="card mb-4" id="status-card" data-session-id="{{.State.SessionID}}">
     <div class="card-body">
       <div class="d-flex flex-wrap align-items-center gap-2 gap-sm-3 mb-3">
         <span class="badge rounded-pill {{statusBadge .State.Status}}" id="status-pill">{{.State.Status}}</span>
@@ -200,10 +242,15 @@ setInterval(refresh, 1000);
       </dl>
 
       {{if .ControlEnabled}}
-      <div class="d-flex flex-wrap gap-2 mt-3" role="group" aria-label="scanner controls">
+      <div class="d-flex flex-wrap align-items-center gap-2 mt-3" role="group" aria-label="scanner controls">
+        <select class="form-select form-select-sm w-auto" id="dpi" aria-label="scan resolution" title="Resolution used for New/Add, from the web UI only">
+          <option value="300" selected>300 dpi</option>
+          <option value="600">600 dpi</option>
+        </select>
         <button type="button" class="btn btn-primary action-btn" data-key="a"{{if $busy}} disabled{{end}}>New</button>
         <button type="button" class="btn btn-primary action-btn" data-key="b"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Add</button>
         <button type="button" class="btn btn-primary action-btn" data-key="c"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Finish</button>
+        <button type="button" class="btn btn-outline-primary action-btn" data-action="finish-no-upload" data-download="1"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Finish (no upload)</button>
         <button type="button" class="btn btn-danger action-btn ms-sm-auto" data-action="discard"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Discard</button>
       </div>
       {{end}}

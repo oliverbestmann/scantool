@@ -35,20 +35,15 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// fakeScanScript stands in for scan-page.sh: there is no SANE here, so it
-// just copies a prepared single page PDF to the requested destination.
-func fakeScanScript(t *testing.T, dir string) string {
+// fakeScanner stands in for a real SANE scanner: there is no hardware here,
+// so it just writes a prepared single page PDF to the requested destination.
+func fakeScanner(t *testing.T) scan.Scanner {
 	t.Helper()
 
-	fixture := filepath.Join(dir, "fixture.pdf")
-	testpdf.Write(t, fixture, 128)
-
-	script := filepath.Join(dir, "scan-page.sh")
-	body := "#!/bin/sh\nsleep 0.01\ncp " + fixture + " \"$1\"\n"
-	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return script
+	return scan.Func(func(_ context.Context, req scan.Request) error {
+		testpdf.Write(t, req.Dest, 128)
+		return nil
+	})
 }
 
 // TestDaemonEndToEnd wires up the same pieces as main and drives the daemon
@@ -67,7 +62,7 @@ func TestDaemonEndToEnd(t *testing.T) {
 
 	manager, err := session.New(session.Options{
 		OutDir:   outDir,
-		Scanner:  &scan.ShellScanner{Command: fakeScanScript(t, root), Timeout: 30 * time.Second},
+		Scanner:  fakeScanner(t),
 		Merger:   &pdfmerge.PDFCPU{},
 		Recorder: db,
 		Logger:   logger,
@@ -80,7 +75,7 @@ func TestDaemonEndToEnd(t *testing.T) {
 	defer cancel()
 
 	keyCh := make(chan rune, 32)
-	actionCh := make(chan session.Action, 32)
+	actionCh := make(chan webAction, 32)
 	sourceDone := make(chan error, 1)
 
 	loopDone := make(chan error, 1)
@@ -98,8 +93,8 @@ func TestDaemonEndToEnd(t *testing.T) {
 		State:  manager.State,
 		Reader: db,
 		Logger: logger,
-		Submit: func(a session.Action) error {
-			actionCh <- a
+		Submit: func(a session.Action, resolution string) error {
+			actionCh <- webAction{Action: a, Resolution: resolution}
 			return nil
 		},
 	})
@@ -198,7 +193,6 @@ func TestDaemonResumesAnOpenDocumentAfterRestart(t *testing.T) {
 	outDir := filepath.Join(root, "scans")
 	dbPath := filepath.Join(root, "scantool.db")
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	scanScript := fakeScanScript(t, root)
 
 	db, err := store.Open(dbPath)
 	if err != nil {
@@ -207,7 +201,7 @@ func TestDaemonResumesAnOpenDocumentAfterRestart(t *testing.T) {
 
 	manager, err := session.New(session.Options{
 		OutDir:   outDir,
-		Scanner:  &scan.ShellScanner{Command: scanScript},
+		Scanner:  fakeScanner(t),
 		Merger:   &pdfmerge.PDFCPU{},
 		Recorder: db,
 		Logger:   logger,
@@ -220,7 +214,7 @@ func TestDaemonResumesAnOpenDocumentAfterRestart(t *testing.T) {
 	keyCh := make(chan rune, 8)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- loop(ctx, manager, keyCh, make(chan session.Action), make(chan error, 1), logger, 0)
+		loopDone <- loop(ctx, manager, keyCh, make(chan webAction), make(chan error, 1), logger, 0)
 	}()
 
 	keyCh <- 'a'
@@ -255,7 +249,7 @@ func TestDaemonResumesAnOpenDocumentAfterRestart(t *testing.T) {
 
 	manager2, err := session.New(session.Options{
 		OutDir:   outDir,
-		Scanner:  &scan.ShellScanner{Command: scanScript},
+		Scanner:  fakeScanner(t),
 		Merger:   &pdfmerge.PDFCPU{},
 		Recorder: db2,
 		Logger:   logger,
@@ -301,7 +295,7 @@ func TestLoopFinishesAnOpenDocumentAfterIdleTimeout(t *testing.T) {
 
 	manager, err := session.New(session.Options{
 		OutDir:   outDir,
-		Scanner:  &scan.ShellScanner{Command: fakeScanScript(t, root)},
+		Scanner:  fakeScanner(t),
 		Merger:   &pdfmerge.PDFCPU{},
 		Recorder: db,
 		Logger:   logger,
@@ -316,7 +310,7 @@ func TestLoopFinishesAnOpenDocumentAfterIdleTimeout(t *testing.T) {
 	keyCh := make(chan rune, 8)
 	loopDone := make(chan error, 1)
 	go func() {
-		loopDone <- loop(ctx, manager, keyCh, make(chan session.Action), make(chan error, 1), logger, 20*time.Millisecond)
+		loopDone <- loop(ctx, manager, keyCh, make(chan webAction), make(chan error, 1), logger, 20*time.Millisecond)
 	}()
 
 	keyCh <- 'a'
@@ -359,7 +353,7 @@ func TestLoopStopsWhenTheKeySourceQuits(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- loop(t.Context(), manager, make(chan rune), make(chan session.Action), sourceDone, logger, 0)
+		done <- loop(t.Context(), manager, make(chan rune), make(chan webAction), sourceDone, logger, 0)
 	}()
 
 	select {
@@ -388,7 +382,7 @@ func TestLoopReportsAFailingKeySource(t *testing.T) {
 	sourceDone := make(chan error, 1)
 	sourceDone <- os.ErrPermission
 
-	err = loop(t.Context(), manager, make(chan rune), make(chan session.Action), sourceDone, logger, 0)
+	err = loop(t.Context(), manager, make(chan rune), make(chan webAction), sourceDone, logger, 0)
 	if err == nil {
 		t.Fatal("want the loop to report a broken key source, got nil")
 	}
@@ -396,15 +390,7 @@ func TestLoopReportsAFailingKeySource(t *testing.T) {
 
 func TestNewScanner(t *testing.T) {
 	if _, ok := newScanner(config{}).(*scan.SaneScanner); !ok {
-		t.Error("empty scan-command should use the built-in SANE scanner")
-	}
-
-	shell, ok := newScanner(config{scanCmd: "/usr/local/bin/my-scan.sh"}).(*scan.ShellScanner)
-	if !ok {
-		t.Fatal("a scan-command should use the external scanner")
-	}
-	if shell.Command != "/usr/local/bin/my-scan.sh" {
-		t.Fatalf("shell.Command = %q", shell.Command)
+		t.Error("newScanner should use the built-in SANE scanner")
 	}
 }
 

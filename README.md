@@ -101,12 +101,12 @@ Two other backends exist:
 
 ### Scanning a page
 
-By default scantool scans a page itself: `scanimage --format=pnm` straight
-into memory, piped as `pnm:-` into `magick convert -quality 95 -level
-0%,90%` to a JPEG, then `img2pdf` to wrap it into a single page PDF. The PNM
-buffer is preallocated from the expected width, height, resolution and mode
-instead of growing as scanimage writes to it. It is configured entirely
-through the environment:
+scantool scans a page itself: `scanimage --format=pnm` straight into memory,
+piped as `pnm:-` into `magick convert -quality 95 -level 0%,90%` to a JPEG,
+then `img2pdf` to wrap it into a single page PDF. The PNM buffer is
+preallocated from the expected width, height, resolution and mode instead of
+growing as scanimage writes to it. It is configured entirely through the
+environment:
 
 | Variable          | Meaning                                  | Default              |
 |-------------------|-------------------------------------------|---------------------|
@@ -117,11 +117,9 @@ through the environment:
 | `SCAN_WIDTH`      | scan area width in mm, scanimage's `-x`    | `210` (A4)           |
 | `SCAN_HEIGHT`     | scan area height in mm, scanimage's `-y`   | `297` (A4)           |
 
-`--scan-command <cmd>` replaces all of that with an external script, called
-once per page as `<cmd> <output.pdf>`, which must write a single page PDF to
-that path. It also gets `SCANTOOL_DEST`, `SCANTOOL_SESSION` and
-`SCANTOOL_PAGE` in the environment. Anything it prints is kept and shown in
-the web UI when a scan fails.
+The web UI offers a dpi dropdown (300 or 600) next to the scan buttons,
+overriding `SCAN_RESOLUTION` for that scan; pages scanned from a keyboard
+always use the configured default.
 
 A cancelled or timed out scan kills the whole process group, so a hanging
 `scanimage` cannot keep the scanner busy.
@@ -189,7 +187,7 @@ The tests need neither a scanner nor a keyboard:
 | `main.go`           | Flags, wiring, the action loop and shutdown          |
 | `internal/keys`     | Key sources: evdev, libinput, stdin                  |
 | `internal/session`  | The state machine behind `a`, `b` and `c`            |
-| `internal/scan`     | Scanning a page: built-in SANE scanner or `--scan-command` |
+| `internal/scan`     | Scanning a page via the built-in SANE scanner |
 | `internal/pdfmerge` | Merging pages into a document                        |
 | `internal/store`    | SQLite: sessions and the action log                  |
 | `internal/web`      | Status page and JSON API                             |
