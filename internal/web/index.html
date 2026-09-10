@@ -290,14 +290,6 @@ setInterval(refresh, 1000);
         </div>
       </dl>
 
-      {{if and .State.SessionActive (gt .State.Pages 0)}}
-      <div class="thumbnail-strip mt-3" id="thumbnails">
-        {{range pagesDesc .State.Pages}}
-        <img class="thumbnail" src="api/thumbnail?page={{.}}" alt="Page {{.}}">
-        {{end}}
-      </div>
-      {{end}}
-
       {{if .ControlEnabled}}
       <select class="form-select form-select-sm w-auto mt-3" id="dpi" aria-label="scan resolution" title="Resolution used for New/Add, from the web UI only">
         <option value="300" selected>300 dpi</option>
@@ -305,10 +297,18 @@ setInterval(refresh, 1000);
       </select>
       <div class="d-flex flex-wrap align-items-center gap-2 mt-3" role="group" aria-label="scanner controls">
         <button type="button" class="btn btn-primary action-btn{{if .State.SessionActive}} d-none{{end}}" data-key="a"{{if $busy}} disabled{{end}}>New</button>
-        <button type="button" class="btn btn-primary action-btn" data-key="b"{{if or $busy (not .State.SessionActive)}} disabled{{end}}>Add</button>
+        <button type="button" class="btn btn-primary action-btn{{if not .State.SessionActive}} d-none{{end}}" data-key="b"{{if $busy}} disabled{{end}}>Add</button>
         <button type="button" class="btn btn-primary action-btn{{if eq .State.Pages 0}} d-none{{end}}" data-key="c"{{if $busy}} disabled{{end}}>Finish</button>
         <button type="button" class="btn btn-outline-primary action-btn{{if eq .State.Pages 0}} d-none{{end}}" data-action="finish-no-upload" data-download="1"{{if $busy}} disabled{{end}}>Finish (no upload)</button>
         <button type="button" class="btn btn-danger action-btn ms-sm-auto{{if eq .State.Pages 0}} d-none{{end}}" data-action="discard"{{if $busy}} disabled{{end}}>Discard</button>
+      </div>
+      {{end}}
+
+      {{if and .State.SessionActive (gt .State.Pages 0)}}
+      <div class="thumbnail-strip mt-3" id="thumbnails">
+        {{range pagesDesc .State.Pages}}
+        <img class="thumbnail" src="api/thumbnail?page={{.}}" alt="Page {{.}}">
+        {{end}}
       </div>
       {{end}}
     </div>
