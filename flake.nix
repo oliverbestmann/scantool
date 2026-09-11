@@ -36,7 +36,7 @@
 
             src = pkgs.lib.cleanSource ./.;
 
-            vendorHash = "sha256-xANpKbWmRYrP7nhaXvl7LYyL4Siw2giGlIOeB5OfcXc=";
+            vendorHash = "sha256-IWBcbY91eoD1qQEC/e/B6qjzP9bOclCkkSRLP1x68KM=";
 
             # Pure Go build (modernc.org/sqlite has no cgo dependency).
             env.CGO_ENABLED = 0;
