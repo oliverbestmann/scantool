@@ -1,6 +1,7 @@
 package web_test
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
@@ -316,6 +317,89 @@ func TestDownloadEndpointRejectsBadID(t *testing.T) {
 	handler := newServer(t, web.Options{Reader: &fakeReader{}})
 
 	rec := get(t, handler, "/api/sessions/not-a-number/download")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+}
+
+func TestDocumentsListLinksToRetryUploadOnlyWhenFailedAndEnabled(t *testing.T) {
+	reader := &fakeReader{sessions: []store.Session{
+		{ID: 9, Status: store.StatusSaved, OutputPath: "/scans/a.pdf", UploadStatus: store.UploadFailed},
+	}}
+
+	// RetryUpload configured and the upload failed: the button is shown.
+	handler := newServer(t, web.Options{Reader: reader, RetryUpload: func(context.Context, int64) error { return nil }})
+	body := get(t, handler, "/").Body.String()
+	if !strings.Contains(body, `data-retry-upload="9"`) {
+		t.Fatalf("page does not offer a retry-upload button for the failed session: %s", body)
+	}
+
+	// Without RetryUpload configured, no button even though the upload failed.
+	// (The JS source itself mentions the "data-retry-upload" attribute name
+	// in its selector, so check for the rendered, id-specific button.)
+	handler = newServer(t, web.Options{Reader: reader})
+	body = get(t, handler, "/").Body.String()
+	if strings.Contains(body, `data-retry-upload="9"`) {
+		t.Fatalf("page offers retry-upload although it is disabled: %s", body)
+	}
+
+	// A successfully uploaded session gets no button either.
+	reader = &fakeReader{sessions: []store.Session{
+		{ID: 9, Status: store.StatusSaved, OutputPath: "/scans/a.pdf", UploadStatus: store.UploadUploaded},
+	}}
+	handler = newServer(t, web.Options{Reader: reader, RetryUpload: func(context.Context, int64) error { return nil }})
+	body = get(t, handler, "/").Body.String()
+	if strings.Contains(body, `data-retry-upload="9"`) {
+		t.Fatalf("page offers retry-upload for a session whose upload already succeeded: %s", body)
+	}
+}
+
+func TestRetryUploadEndpointCallsRetryUpload(t *testing.T) {
+	var gotID int64
+	handler := newServer(t, web.Options{
+		RetryUpload: func(_ context.Context, id int64) error {
+			gotID = id
+			return nil
+		},
+	})
+
+	rec := post(t, handler, "/api/sessions/9/retry-upload")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body: %s", rec.Code, rec.Body.String())
+	}
+	if gotID != 9 {
+		t.Fatalf("RetryUpload called with id %d, want 9", gotID)
+	}
+}
+
+func TestRetryUploadEndpointReportsFailure(t *testing.T) {
+	handler := newServer(t, web.Options{
+		RetryUpload: func(context.Context, int64) error { return errors.New("server unreachable") },
+	})
+
+	rec := post(t, handler, "/api/sessions/9/retry-upload")
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "server unreachable") {
+		t.Fatalf("body = %q", rec.Body.String())
+	}
+}
+
+func TestRetryUploadEndpointIsForbiddenWithoutControl(t *testing.T) {
+	handler := newServer(t, web.Options{})
+
+	if rec := post(t, handler, "/api/sessions/9/retry-upload"); rec.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403", rec.Code)
+	}
+}
+
+func TestRetryUploadEndpointRejectsBadID(t *testing.T) {
+	handler := newServer(t, web.Options{
+		RetryUpload: func(context.Context, int64) error { return nil },
+	})
+
+	rec := post(t, handler, "/api/sessions/not-a-number/retry-upload")
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400", rec.Code)
 	}

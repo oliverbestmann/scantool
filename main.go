@@ -149,6 +149,7 @@ func run() error {
 	actionCh := make(chan webAction)
 
 	var submit func(session.Action, string) error
+	var retryUpload func(context.Context, int64) error
 	if cfg.webControl {
 		submit = func(a session.Action, resolution string) error {
 			select {
@@ -158,16 +159,22 @@ func run() error {
 				return errors.New("scantool is busy, try again in a moment")
 			}
 		}
+		// Unlike submit, retrying an upload targets a past, no longer
+		// active session, so it doesn't need the action loop: it can just
+		// run manager.RetryUpload directly, concurrently with whatever the
+		// loop is doing.
+		retryUpload = manager.RetryUpload
 	}
 
 	if cfg.httpAddr != "" {
 		server, err := web.New(web.Options{
-			Addr:       cfg.httpAddr,
-			State:      manager.State,
-			Reader:     db,
-			Submit:     submit,
-			LemmaryURL: cfg.lemmaryURL,
-			Logger:     logger,
+			Addr:        cfg.httpAddr,
+			State:       manager.State,
+			Reader:      db,
+			Submit:      submit,
+			RetryUpload: retryUpload,
+			LemmaryURL:  cfg.lemmaryURL,
+			Logger:      logger,
 		})
 		if err != nil {
 			return err

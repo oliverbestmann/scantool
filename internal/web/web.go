@@ -47,6 +47,12 @@ type Options struct {
 	// scan resolution override (dpi, e.g. "600"; empty uses the default).
 	// When nil the page is read only.
 	Submit func(action session.Action, resolution string) error
+	// RetryUpload re-attempts uploading a past session's document after its
+	// automatic upload failed. Unlike Submit, it runs synchronously and
+	// reports the actual outcome, since it acts on a session that is no
+	// longer active rather than going through the daemon's single action
+	// loop. When nil, the retry button is not shown.
+	RetryUpload func(ctx context.Context, sessionID int64) error
 	// LemmaryURL is the base URL of the lemmary server documents were
 	// uploaded to, used to link a session to its document there. Empty
 	// disables the link.
@@ -109,6 +115,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/state", s.handleState)
 	mux.HandleFunc("POST /api/action", s.handleAction)
 	mux.HandleFunc("GET /api/sessions/{id}/download", s.handleDownload)
+	mux.HandleFunc("POST /api/sessions/{id}/retry-upload", s.handleRetryUpload)
 	mux.HandleFunc("GET /api/thumbnail", s.handleThumbnail)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
@@ -146,10 +153,14 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 // the DOM down on first refresh.
 type indexData struct {
 	ControlEnabled bool
-	Now            time.Time
-	State          session.State
-	Blocks         []block
-	LemmaryURL     string
+	// RetryUploadEnabled shows the retry-upload button on a session whose
+	// upload failed. Separate from ControlEnabled since a deployment could
+	// enable one without the other.
+	RetryUploadEnabled bool
+	Now                time.Time
+	State              session.State
+	Blocks             []block
+	LemmaryURL         string
 }
 
 // loadIndexData gathers the data shown on the page, shared by the full page
@@ -175,11 +186,12 @@ func (s *Server) loadIndexData() (indexData, error) {
 	}
 
 	return indexData{
-		ControlEnabled: s.opts.Submit != nil,
-		Now:            time.Now(),
-		State:          s.opts.State(),
-		Blocks:         buildBlocks(sessions, sessionActions, recentActions),
-		LemmaryURL:     s.opts.LemmaryURL,
+		ControlEnabled:     s.opts.Submit != nil,
+		RetryUploadEnabled: s.opts.RetryUpload != nil,
+		Now:                time.Now(),
+		State:              s.opts.State(),
+		Blocks:             buildBlocks(sessions, sessionActions, recentActions),
+		LemmaryURL:         s.opts.LemmaryURL,
 	}, nil
 }
 
@@ -290,6 +302,32 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Disposition", `attachment; filename="`+filepath.Base(sess.OutputPath)+`"`)
 	http.ServeFile(w, r, sess.OutputPath)
+}
+
+// handleRetryUpload re-attempts uploading a session's document after its
+// automatic upload failed. Unlike handleAction, it runs synchronously
+// instead of queuing: it acts on a past session rather than the daemon's
+// single active one, so it does not contend with scanning and the request
+// can simply wait for the outcome.
+func (s *Server) handleRetryUpload(w http.ResponseWriter, r *http.Request) {
+	if s.opts.RetryUpload == nil {
+		s.fail(w, r, http.StatusForbidden, errors.New("web control is disabled"))
+		return
+	}
+
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		s.fail(w, r, http.StatusBadRequest, errors.New("invalid session id"))
+		return
+	}
+
+	if err := s.opts.RetryUpload(r.Context(), id); err != nil {
+		s.fail(w, r, http.StatusBadGateway, err)
+		return
+	}
+
+	s.opts.Logger.Info("upload retried from web ui", "session", id, "remote", r.RemoteAddr)
+	writeJSON(w, http.StatusOK, map[string]string{"status": "uploaded"})
 }
 
 // handleThumbnail serves one page's thumbnail from the current session,

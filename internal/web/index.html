@@ -233,6 +233,36 @@ document.addEventListener("click", async (e) => {
   }
 });
 
+// Retrying an upload targets one past session rather than the daemon's
+// single active one, so it's independent of the New/Add/Finish buttons
+// above: only the clicked button is disabled, and the request runs
+// alongside whatever else the daemon is doing.
+document.addEventListener("click", async (e) => {
+  const button = e.target.closest("button[data-retry-upload]");
+  if (!button) return;
+
+  // The button lives inside a session's <summary>; without this, the click
+  // would also toggle that session card open/closed. stopPropagation isn't
+  // an option here since this listener itself is on document and relies on
+  // the event bubbling up to it.
+  e.preventDefault();
+
+  button.disabled = true;
+  try {
+    const id = encodeURIComponent(button.dataset.retryUpload);
+    const res = await fetch("api/sessions/" + id + "/retry-upload", { method: "POST" });
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      complain(body.error || "request failed with HTTP " + res.status);
+    }
+    await refresh();
+  } catch (e) {
+    complain(e.message);
+  } finally {
+    button.disabled = false;
+  }
+});
+
 refresh();
 setInterval(refresh, 1000);
 </script>
@@ -337,6 +367,7 @@ setInterval(refresh, 1000);
           <span class="text-body-secondary small tnum">{{pageCount .Session.Pages}}</span>
           <div class="ms-auto d-flex align-items-center gap-2">
             {{with lemmaryLink $.LemmaryURL .Session.LemmaryID}}<a href="{{.}}" target="_blank" rel="noopener" onclick="event.stopPropagation()" class="text-body-secondary" title="Open in lemmary" aria-label="Open in lemmary"><i class="bi bi-box-arrow-up-right"></i></a>{{end}}
+            {{if and $.RetryUploadEnabled (eq .Session.UploadStatus "failed")}}<button type="button" class="btn btn-link p-0 text-primary" data-retry-upload="{{.Session.ID}}" title="Upload failed{{if .Session.UploadError}}: {{.Session.UploadError}}{{end}} — click to retry" aria-label="Retry upload"><i class="bi bi-arrow-repeat"></i></button>{{end}}
             {{if .Session.OutputPath}}<a href="api/sessions/{{.Session.ID}}/download" onclick="event.stopPropagation()" class="text-body-secondary" title="Download {{base .Session.OutputPath}}" aria-label="Download {{base .Session.OutputPath}}"><i class="bi bi-download"></i></a>
             {{else if .Session.Error}}<i class="bi bi-exclamation-triangle text-danger" title="{{.Session.Error}}" aria-label="{{.Session.Error}}"></i>{{end}}
           </div>

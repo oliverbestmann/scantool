@@ -1102,6 +1102,103 @@ func TestFinishKeepsDocumentWhenUploadFails(t *testing.T) {
 	}
 }
 
+// TestRetryUploadSucceedsAfterEarlierFailure verifies that RetryUpload can
+// re-attempt an upload for a session that is no longer active, and that a
+// success updates the session and appends to the action log just like the
+// original automatic attempt would have.
+func TestRetryUploadSucceedsAfterEarlierFailure(t *testing.T) {
+	uploader := &fakeUploader{err: errors.New("server unreachable")}
+	h := newHarness(t, func(o *session.Options) { o.Uploader = uploader })
+
+	h.press('a', 'b', 'c')
+
+	sessions := h.sessions()
+	if len(sessions) != 1 || sessions[0].UploadStatus != store.UploadFailed {
+		t.Fatalf("sessions = %+v, want a single session with upload_status %q", sessions, store.UploadFailed)
+	}
+	sessionID := sessions[0].ID
+
+	// The retry succeeds this time.
+	uploader.mu.Lock()
+	uploader.err = nil
+	uploader.id = "record-456"
+	uploader.mu.Unlock()
+
+	if err := h.manager.RetryUpload(t.Context(), sessionID); err != nil {
+		t.Fatalf("RetryUpload: %v", err)
+	}
+
+	sessions = h.sessions()
+	if sessions[0].UploadStatus != store.UploadUploaded {
+		t.Fatalf("upload_status = %q, want %q", sessions[0].UploadStatus, store.UploadUploaded)
+	}
+	if sessions[0].LemmaryID != "record-456" {
+		t.Fatalf("lemmary_id = %q, want record-456", sessions[0].LemmaryID)
+	}
+
+	kinds := h.actionKinds()
+	if kinds[len(kinds)-1] != store.KindUploadSucceeded {
+		t.Fatalf("last action = %q, want %q", kinds[len(kinds)-1], store.KindUploadSucceeded)
+	}
+}
+
+// TestRetryUploadReportsTheUploaderError verifies that a retry which fails
+// again surfaces the Uploader's error to the caller, rather than swallowing
+// it like the fire-and-forget automatic attempt does.
+func TestRetryUploadReportsTheUploaderError(t *testing.T) {
+	uploader := &fakeUploader{err: errors.New("server unreachable")}
+	h := newHarness(t, func(o *session.Options) { o.Uploader = uploader })
+
+	h.press('a', 'b', 'c')
+	sessionID := h.sessions()[0].ID
+
+	err := h.manager.RetryUpload(t.Context(), sessionID)
+	if err == nil || !strings.Contains(err.Error(), "server unreachable") {
+		t.Fatalf("RetryUpload error = %v, want it to mention the uploader's failure", err)
+	}
+}
+
+// TestRetryUploadRejectsASessionThatDidNotFail verifies that RetryUpload
+// refuses to re-upload a session whose last attempt already succeeded (or
+// that never had one), rather than uploading a document twice by accident.
+func TestRetryUploadRejectsASessionThatDidNotFail(t *testing.T) {
+	uploader := &fakeUploader{id: "record-123"}
+	h := newHarness(t, func(o *session.Options) { o.Uploader = uploader })
+
+	h.press('a', 'b', 'c')
+	sessionID := h.sessions()[0].ID
+
+	if err := h.manager.RetryUpload(t.Context(), sessionID); err == nil {
+		t.Fatal("want an error retrying a session whose upload already succeeded")
+	}
+	if got := uploader.uploaded(); len(got) != 1 {
+		t.Fatalf("uploaded = %v, want the original attempt only, no retry", got)
+	}
+}
+
+// TestRetryUploadRequiresAnUploader verifies RetryUpload fails cleanly when
+// no Uploader is configured, instead of panicking on a nil Uploader.
+func TestRetryUploadRequiresAnUploader(t *testing.T) {
+	h := newHarness(t, nil)
+
+	h.press('a', 'b', 'c')
+	sessionID := h.sessions()[0].ID
+
+	if err := h.manager.RetryUpload(t.Context(), sessionID); err == nil {
+		t.Fatal("want an error when no Uploader is configured")
+	}
+}
+
+// TestRetryUploadRejectsUnknownSession verifies RetryUpload reports an error
+// for a session id that does not exist, instead of trying to upload nothing.
+func TestRetryUploadRejectsUnknownSession(t *testing.T) {
+	h := newHarness(t, func(o *session.Options) { o.Uploader = &fakeUploader{} })
+
+	if err := h.manager.RetryUpload(t.Context(), 999); err == nil {
+		t.Fatal("want an error for an unknown session id")
+	}
+}
+
 func TestNewValidatesOptions(t *testing.T) {
 	base := func() session.Options {
 		return session.Options{

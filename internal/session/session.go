@@ -108,6 +108,9 @@ type Recorder interface {
 	// SessionPages returns the recorded page paths of a session, so a
 	// restarted daemon can rebuild its in-memory session from the database.
 	SessionPages(sessionID int64) ([]string, error)
+	// Session loads a single session by id, so RetryUpload can look up a
+	// past, no longer active session by the id the web UI gives it.
+	Session(id int64) (store.Session, error)
 }
 
 // Uploader posts a finished document somewhere else, e.g. a lemmary server.
@@ -772,8 +775,10 @@ func (m *Manager) record(a store.Action) int64 {
 
 // upload posts the finished document and records the outcome on the
 // session. The document stays on disk either way, so a failed upload can be
-// retried later.
-func (m *Manager) upload(ctx context.Context, sessionID int64, path string, log *slog.Logger) {
+// retried later via RetryUpload. Returns the Uploader's error, if any, so
+// RetryUpload can report it back to its caller; the regular post-finish
+// call site ignores it, since it is already logged and recorded here.
+func (m *Manager) upload(ctx context.Context, sessionID int64, path string, log *slog.Logger) error {
 	status, errMsg := store.UploadUploaded, ""
 	kind := store.KindUploadSucceeded
 
@@ -789,9 +794,35 @@ func (m *Manager) upload(ctx context.Context, sessionID int64, path string, log 
 	}
 
 	action := store.Action{Kind: kind, SessionID: sessionID, Detail: detail, Error: errMsg}
-	if err := m.opts.Recorder.RecordUploadWithAction(sessionID, status, lemmaryID, errMsg, action); err != nil {
-		log.Warn("could not record upload outcome", "error", err)
+	if recErr := m.opts.Recorder.RecordUploadWithAction(sessionID, status, lemmaryID, errMsg, action); recErr != nil {
+		log.Warn("could not record upload outcome", "error", recErr)
 	}
+
+	return err
+}
+
+// RetryUpload re-attempts uploading a finished session's document after an
+// earlier automatic upload failed. Unlike Do/DoLogged, it acts directly on
+// sessionID rather than the active session and does not take runMu, so it
+// can run for any past session concurrently with whatever the daemon is
+// doing right now (including another scan in progress).
+func (m *Manager) RetryUpload(ctx context.Context, sessionID int64) error {
+	if m.opts.Uploader == nil {
+		return errors.New("session: retry upload: uploads are not configured")
+	}
+
+	sess, err := m.opts.Recorder.Session(sessionID)
+	if err != nil {
+		return fmt.Errorf("session: retry upload: %w", err)
+	}
+	if sess.OutputPath == "" {
+		return errors.New("session: retry upload: session has no document")
+	}
+	if sess.UploadStatus != store.UploadFailed {
+		return fmt.Errorf("session: retry upload: last upload status was %q, not failed", sess.UploadStatus)
+	}
+
+	return m.upload(ctx, sessionID, sess.OutputPath, m.opts.Logger.With("session", sessionID))
 }
 
 func (m *Manager) removeWork(cur *activeSession, log *slog.Logger) {
@@ -864,6 +895,7 @@ func (nopRecorder) AppendAction(store.Action) (int64, error)         { return 0,
 func (nopRecorder) SetActionSessionID(int64, int64) error            { return nil }
 func (nopRecorder) SessionPages(int64) ([]string, error)             { return nil, nil }
 func (nopRecorder) ActiveSession() (store.Session, error)            { return store.Session{}, sql.ErrNoRows }
+func (nopRecorder) Session(int64) (store.Session, error)             { return store.Session{}, sql.ErrNoRows }
 
 func (nopRecorder) FinishSessionWithAction(int64, time.Time, string, string, string, store.Action) error {
 	return nil
