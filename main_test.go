@@ -35,12 +35,25 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// funcScanner adapts a plain function to scan.TwoPhaseScanner for tests that
+// don't care about the two phases: AcquireImage runs it, ProcessImage is a
+// no-op.
+type funcScanner func(ctx context.Context, req scan.Request) error
+
+func (f funcScanner) AcquireImage(ctx context.Context, req scan.Request) ([]byte, error) {
+	return nil, f(ctx, req)
+}
+
+func (f funcScanner) ProcessImage(context.Context, scan.Request, []byte) error {
+	return nil
+}
+
 // fakeScanner stands in for a real SANE scanner: there is no hardware here,
 // so it just writes a prepared single page PDF to the requested destination.
-func fakeScanner(t *testing.T) scan.Scanner {
+func fakeScanner(t *testing.T) scan.TwoPhaseScanner {
 	t.Helper()
 
-	return scan.Func(func(_ context.Context, req scan.Request) error {
+	return funcScanner(func(_ context.Context, req scan.Request) error {
 		testpdf.Write(t, req.Dest, 128)
 		return nil
 	})
@@ -340,7 +353,7 @@ func TestLoopStopsWhenTheKeySourceQuits(t *testing.T) {
 
 	manager, err := session.New(session.Options{
 		OutDir:  filepath.Join(t.TempDir(), "scans"),
-		Scanner: scan.Func(func(context.Context, scan.Request) error { return nil }),
+		Scanner: funcScanner(func(context.Context, scan.Request) error { return nil }),
 		Merger:  pdfmerge.Func(func([]string, string) error { return nil }),
 		Logger:  logger,
 	})
@@ -371,7 +384,7 @@ func TestLoopReportsAFailingKeySource(t *testing.T) {
 
 	manager, err := session.New(session.Options{
 		OutDir:  filepath.Join(t.TempDir(), "scans"),
-		Scanner: scan.Func(func(context.Context, scan.Request) error { return nil }),
+		Scanner: funcScanner(func(context.Context, scan.Request) error { return nil }),
 		Merger:  pdfmerge.Func(func([]string, string) error { return nil }),
 		Logger:  logger,
 	})

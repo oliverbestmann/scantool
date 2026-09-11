@@ -22,6 +22,8 @@ import (
 
 // fakeScanner stands in for scan-page.sh: it writes a recognisable text file
 // instead of talking to SANE, and can be told to fail on a given attempt.
+// It does the whole fake scan synchronously in AcquireImage; ProcessImage is
+// a no-op.
 type fakeScanner struct {
 	mu       sync.Mutex
 	requests []scan.Request
@@ -32,7 +34,7 @@ type fakeScanner struct {
 	hook func(scan.Request)
 }
 
-func (f *fakeScanner) ScanPage(_ context.Context, req scan.Request) error {
+func (f *fakeScanner) AcquireImage(_ context.Context, req scan.Request) ([]byte, error) {
 	f.mu.Lock()
 	f.requests = append(f.requests, req)
 	attempt := len(f.requests)
@@ -44,15 +46,32 @@ func (f *fakeScanner) ScanPage(_ context.Context, req scan.Request) error {
 		hook(req)
 	}
 	if err != nil {
-		return err
+		return nil, err
 	}
-	return os.WriteFile(req.Dest, []byte(fmt.Sprintf("session %d page %d\n", req.SessionID, req.Page)), 0o644)
+	return nil, os.WriteFile(req.Dest, []byte(fmt.Sprintf("session %d page %d\n", req.SessionID, req.Page)), 0o644)
+}
+
+func (f *fakeScanner) ProcessImage(context.Context, scan.Request, []byte) error {
+	return nil
 }
 
 func (f *fakeScanner) count() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return len(f.requests)
+}
+
+// funcScanner adapts a plain function to scan.TwoPhaseScanner for tests that
+// don't care about the two phases: AcquireImage runs it, ProcessImage is a
+// no-op.
+type funcScanner func(ctx context.Context, req scan.Request) error
+
+func (f funcScanner) AcquireImage(ctx context.Context, req scan.Request) ([]byte, error) {
+	return nil, f(ctx, req)
+}
+
+func (f funcScanner) ProcessImage(context.Context, scan.Request, []byte) error {
+	return nil
 }
 
 // fakePipelinedScanner is a scan.TwoPhaseScanner test double. AcquireImage
@@ -76,14 +95,6 @@ func newFakePipelinedScanner() *fakePipelinedScanner {
 		gate:        map[int]chan struct{}{},
 		done:        make(chan scan.Request, 16),
 	}
-}
-
-func (f *fakePipelinedScanner) ScanPage(ctx context.Context, req scan.Request) error {
-	image, err := f.AcquireImage(ctx, req)
-	if err != nil {
-		return err
-	}
-	return f.ProcessImage(ctx, req, image)
 }
 
 func (f *fakePipelinedScanner) AcquireImage(_ context.Context, req scan.Request) ([]byte, error) {
@@ -852,7 +863,7 @@ func TestEndToEndProducesARealPDF(t *testing.T) {
 	defer db.Close()
 
 	shade := uint8(0)
-	scanner := scan.Func(func(_ context.Context, req scan.Request) error {
+	scanner := funcScanner(func(_ context.Context, req scan.Request) error {
 		shade += 80
 		testpdf.Write(t, req.Dest, shade)
 		return nil
@@ -1137,8 +1148,27 @@ func TestActionLogOfAFullDocument(t *testing.T) {
 		store.KindKeyPressed, store.KindPageScanned,
 		store.KindKeyPressed, store.KindSessionSaved,
 	}
-	if got := h.actionKinds(); !equalKinds(got, want) {
-		t.Fatalf("action log = %v, want %v", got, want)
+
+	// Each page's KindPageProcessed is recorded by its background
+	// conversion goroutine, concurrently with the action loop handling
+	// later key presses; its position relative to those is racy (the loop
+	// does not wait for one page's conversion before handling the next
+	// key), so it's counted here rather than fit into the exact sequence.
+	got := h.actionKinds()
+	var withoutProcessed []store.Kind
+	processed := 0
+	for _, k := range got {
+		if k == store.KindPageProcessed {
+			processed++
+			continue
+		}
+		withoutProcessed = append(withoutProcessed, k)
+	}
+	if processed != 2 {
+		t.Fatalf("got %d page-processed actions, want 2 (log = %v)", processed, got)
+	}
+	if !equalKinds(withoutProcessed, want) {
+		t.Fatalf("action log (excl. page-processed) = %v, want %v", withoutProcessed, want)
 	}
 
 	actions, err := h.db.RecentActions(1)

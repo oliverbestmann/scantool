@@ -5,11 +5,16 @@ package keys
 import (
 	"context"
 	"errors"
+	"time"
 )
 
 // ErrQuit is returned by a Source when the user asked the daemon to stop,
 // e.g. by pressing Ctrl-C on a raw terminal.
 var ErrQuit = errors.New("keys: quit requested")
+
+// sendTimeout bounds how long send waits for the daemon to become ready to
+// receive a key before giving up on it.
+const sendTimeout = 5 * time.Second
 
 // Source delivers key presses on out until ctx is cancelled.
 type Source interface {
@@ -20,15 +25,18 @@ type Source interface {
 	Name() string
 }
 
-// send delivers a key if out is ready to receive it right now, and discards
-// it otherwise (e.g. while the daemon is busy handling a previous key). It
-// reports false only when ctx was cancelled first.
+// send delivers a key to out, waiting up to sendTimeout for the daemon to be
+// ready to receive it (e.g. while it is busy handling a previous key) before
+// discarding it. It reports false only when ctx was cancelled first.
 func send(ctx context.Context, out chan<- rune, key rune) bool {
+	timer := time.NewTimer(sendTimeout)
+	defer timer.Stop()
+
 	select {
 	case out <- key:
 	case <-ctx.Done():
 		return false
-	default:
+	case <-timer.C:
 	}
 	return true
 }

@@ -125,7 +125,11 @@ type State struct {
 	SessionID        int64     `json:"session_id,omitempty"`
 	SessionStartedAt time.Time `json:"session_started_at,omitzero"`
 	Pages            int       `json:"pages"`
-	PageSizesKB      []int64   `json:"page_sizes_kb,omitempty"`
+	// Processing counts pages whose background conversion (a TwoPhaseScanner's
+	// ProcessImage) has not finished yet. The pages themselves are already
+	// counted in Pages; finishing or discarding the session waits for these.
+	Processing  int     `json:"processing"`
+	PageSizesKB []int64 `json:"page_sizes_kb,omitempty"`
 	// Thumbnails are the on-disk paths of the current session's page
 	// thumbnails, in scan order, served via /api/thumbnail?page=N. Not
 	// exposed in the JSON state: they're local filesystem paths, not
@@ -149,7 +153,7 @@ type Options struct {
 	// Defaults to "20060102-150405".
 	FileLayout string
 	// Scanner scans a single page. Required.
-	Scanner scan.Scanner
+	Scanner scan.TwoPhaseScanner
 	// Merger merges the pages of a session. Required.
 	Merger pdfmerge.Merger
 	// Recorder persists sessions and the action log. Optional.
@@ -379,11 +383,10 @@ func (m *Manager) hasPages() bool {
 	return m.cur != nil && len(m.cur.pages) > 0
 }
 
-// scan appends one page to the current session, starting one if needed. If
-// the scanner can separate acquiring the image from turning it into a PDF
-// (scan.TwoPhaseScanner), the PDF is produced by a background goroutine so
-// the next page can be acquired right away instead of waiting for it. Must
-// be called with runMu held.
+// scan appends one page to the current session, starting one if needed. The
+// PDF is produced by a background goroutine so the next page can be
+// acquired right away instead of waiting for it. Must be called with runMu
+// held.
 func (m *Manager) scan(ctx context.Context) error {
 	if m.cur == nil {
 		if err := m.start(); err != nil {
@@ -415,25 +418,19 @@ func (m *Manager) scan(ctx context.Context) error {
 
 	started := m.opts.Now()
 
-	if two, ok := m.opts.Scanner.(scan.TwoPhaseScanner); ok {
-		image, err := two.AcquireImage(ctx, req)
-		if err != nil {
-			return m.scanFailed(cur, page, err, log)
-		}
-
-		cur.pending.Add(1)
-		go m.processPage(two, cur, req, image, log)
-	} else if err := m.opts.Scanner.ScanPage(ctx, req); err != nil {
+	image, err := m.opts.Scanner.AcquireImage(ctx, req)
+	if err != nil {
 		return m.scanFailed(cur, page, err, log)
 	}
 
-	// The page is on disk, or (for a TwoPhaseScanner) being written by the
-	// background goroutine just started; recording it and its action
-	// atomically keeps the database's page count and action log from ever
-	// disagreeing with each other, even though a recording failure itself
-	// must not lose the page that was already scanned. The size in the
-	// detail is best effort: for a TwoPhaseScanner the file usually is not
-	// there yet, so it is simply omitted.
+	// The page is about to be handed to a background goroutine for
+	// conversion; recording it and its action atomically keeps the
+	// database's page count and action log from ever disagreeing with each
+	// other, even though a recording failure itself must not lose the page
+	// that was already scanned. The size in the detail is best effort: the
+	// file usually is not there yet, so it is simply omitted. Recording
+	// happens before the goroutine starts so the log can never show that
+	// page's processing result ahead of its scan.
 	detail := pageScanDetail(dest, m.opts.Now().Sub(started))
 	if err := m.opts.Recorder.AddPage(cur.id, page, dest, store.Action{Kind: store.KindPageScanned, SessionID: cur.id, Page: page, Detail: detail}); err != nil {
 		log.Warn("could not record scanned page", "error", err)
@@ -443,6 +440,7 @@ func (m *Manager) scan(ctx context.Context) error {
 	cur.pages = append(cur.pages, dest)
 	pages := len(cur.pages)
 	m.state.Pages = pages
+	m.state.Processing++
 	m.state.PageSizesKB = append(m.state.PageSizesKB, 0)
 	m.state.Thumbnails = append(m.state.Thumbnails, "")
 	m.state.Status = StatusIdle
@@ -450,8 +448,10 @@ func (m *Manager) scan(ctx context.Context) error {
 	m.state.LastError = ""
 	m.mu.Unlock()
 
-	// For a synchronous Scanner, dest and thumbDest already exist by now.
-	// For a TwoPhaseScanner they usually don't yet; processPage calls this
+	cur.pending.Add(1)
+	go m.processPage(m.opts.Scanner, cur, req, image, log)
+
+	// dest and thumbDest usually don't exist yet; processPage calls this
 	// again once the background conversion finishes.
 	m.updatePageResult(cur.id, page, dest, thumbDest)
 
@@ -460,10 +460,10 @@ func (m *Manager) scan(ctx context.Context) error {
 }
 
 // updatePageResult refreshes a page's size and thumbnail in the state once
-// its PDF (and thumbnail) exist on disk. Called right after a synchronous
-// scan, and again by processPage when a TwoPhaseScanner's background
-// conversion completes. A page whose file is not there yet is simply left
-// as is; it is safe to call more than once for the same page.
+// its PDF (and thumbnail) exist on disk. Called right after scan dispatches
+// the background conversion, and again by processPage once that conversion
+// completes. A page whose file is not there yet is simply left as is; it is
+// safe to call more than once for the same page.
 func (m *Manager) updatePageResult(sessionID int64, page int, dest, thumbDest string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -561,6 +561,11 @@ func (m *Manager) scanFailed(cur *activeSession, page int, err error, log *slog.
 // returned by the time this runs.
 func (m *Manager) processPage(two scan.TwoPhaseScanner, cur *activeSession, req scan.Request, image []byte, log *slog.Logger) {
 	defer cur.pending.Done()
+	defer func() {
+		m.mu.Lock()
+		m.state.Processing--
+		m.mu.Unlock()
+	}()
 
 	if err := two.ProcessImage(context.Background(), req, image); err != nil {
 		log.Error("processing page failed", "error", err)
@@ -581,6 +586,7 @@ func (m *Manager) processPage(two scan.TwoPhaseScanner, cur *activeSession, req 
 		return
 	}
 
+	m.record(store.Action{Kind: store.KindPageProcessed, SessionID: cur.id, Page: req.Page})
 	m.updatePageResult(cur.id, req.Page, req.Dest, req.ThumbDest)
 }
 
@@ -604,6 +610,7 @@ func (m *Manager) start() error {
 	m.state.SessionID = id
 	m.state.SessionStartedAt = now
 	m.state.Pages = 0
+	m.state.Processing = 0
 	m.state.PageSizesKB = nil
 	m.state.Thumbnails = nil
 	m.mu.Unlock()
@@ -702,6 +709,7 @@ func (m *Manager) finish(ctx context.Context, upload bool) error {
 	m.state.SessionID = 0
 	m.state.SessionStartedAt = time.Time{}
 	m.state.Pages = 0
+	m.state.Processing = 0
 	m.state.PageSizesKB = nil
 	m.state.Thumbnails = nil
 	m.state.Status = StatusIdle
@@ -841,6 +849,7 @@ func (m *Manager) clear(status Status) {
 	m.state.SessionID = 0
 	m.state.SessionStartedAt = time.Time{}
 	m.state.Pages = 0
+	m.state.Processing = 0
 	m.state.PageSizesKB = nil
 	m.state.Thumbnails = nil
 	m.state.Status = status

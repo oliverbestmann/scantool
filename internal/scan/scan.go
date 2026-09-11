@@ -27,25 +27,12 @@ type Request struct {
 // from the page's aspect ratio.
 const thumbnailWidth = 200
 
-// Scanner scans a single page.
-type Scanner interface {
-	ScanPage(ctx context.Context, req Request) error
-}
-
-// Func adapts a plain function to the Scanner interface.
-type Func func(ctx context.Context, req Request) error
-
-func (f Func) ScanPage(ctx context.Context, req Request) error { return f(ctx, req) }
-
-// TwoPhaseScanner is implemented by scanners that can separate the
-// hardware-bound half of a scan from turning the result into a PDF. Callers
-// that want to scan the next page while the previous one is still
-// converting (the conversion needs no scanner) use this instead of
-// ScanPage. *SaneScanner is the only implementation; DevScanner does both
-// halves as one step and only implements Scanner.
+// TwoPhaseScanner scans a single page, split into the hardware-bound half
+// that produces a raw image and the conversion half that turns it into a
+// PDF, so a caller can start acquiring the next page while the previous one
+// is still converting (the conversion needs no scanner). *SaneScanner and
+// *DevScanner are the implementations.
 type TwoPhaseScanner interface {
-	Scanner
-
 	// AcquireImage does the part of scanning that needs the scanner
 	// hardware and returns the raw image. Calls to AcquireImage must never
 	// overlap with each other.

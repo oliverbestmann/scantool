@@ -24,6 +24,16 @@ func writeTool(t *testing.T, dir, name, body string) string {
 	return path
 }
 
+// scanPage drives a TwoPhaseScanner through both of its phases, for tests
+// that don't care about overlapping them.
+func scanPage(ctx context.Context, s scan.TwoPhaseScanner, req scan.Request) error {
+	image, err := s.AcquireImage(ctx, req)
+	if err != nil {
+		return err
+	}
+	return s.ProcessImage(ctx, req, image)
+}
+
 // happyScanner returns a SaneScanner whose three tools cooperate: scanimage
 // writes a non-empty PNM to stdout, magick "converts" it by copying, and
 // img2pdf writes a fake PDF to its --output path.
@@ -52,8 +62,8 @@ func TestSaneScannerWritesPage(t *testing.T) {
 	s := happyScanner(t)
 
 	dest := filepath.Join(t.TempDir(), "page-001.pdf")
-	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest, SessionID: 4, Page: 1}); err != nil {
-		t.Fatalf("ScanPage: %v", err)
+	if err := scanPage(t.Context(), s, scan.Request{Dest: dest, SessionID: 4, Page: 1}); err != nil {
+		t.Fatalf("scanPage: %v", err)
 	}
 
 	got, err := os.ReadFile(dest)
@@ -87,8 +97,8 @@ func TestSaneScannerPassesResolutionModeDeviceSource(t *testing.T) {
 	defer os.Unsetenv("dir")
 
 	dest := filepath.Join(dir, "page.pdf")
-	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest}); err != nil {
-		t.Fatalf("ScanPage: %v", err)
+	if err := scanPage(t.Context(), s, scan.Request{Dest: dest}); err != nil {
+		t.Fatalf("scanPage: %v", err)
 	}
 
 	got, err := os.ReadFile(filepath.Join(dir, "args"))
@@ -121,8 +131,8 @@ func TestSaneScannerPassesWidthHeight(t *testing.T) {
 	defer os.Unsetenv("dir")
 
 	dest := filepath.Join(dir, "page.pdf")
-	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest}); err != nil {
-		t.Fatalf("ScanPage: %v", err)
+	if err := scanPage(t.Context(), s, scan.Request{Dest: dest}); err != nil {
+		t.Fatalf("scanPage: %v", err)
 	}
 
 	got, err := os.ReadFile(filepath.Join(dir, "args"))
@@ -150,8 +160,8 @@ cat > "$7"
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
 
 	dest := filepath.Join(dir, "page.pdf")
-	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest}); err != nil {
-		t.Fatalf("ScanPage: %v", err)
+	if err := scanPage(t.Context(), s, scan.Request{Dest: dest}); err != nil {
+		t.Fatalf("scanPage: %v", err)
 	}
 }
 
@@ -167,8 +177,8 @@ func TestSaneScannerDefaultsResolutionAndMode(t *testing.T) {
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
 
 	dest := filepath.Join(dir, "page.pdf")
-	if err := s.ScanPage(t.Context(), scan.Request{Dest: dest}); err != nil {
-		t.Fatalf("ScanPage: %v", err)
+	if err := scanPage(t.Context(), s, scan.Request{Dest: dest}); err != nil {
+		t.Fatalf("scanPage: %v", err)
 	}
 
 	got, err := os.ReadFile(filepath.Join(dir, "args"))
@@ -193,7 +203,7 @@ func TestSaneScannerRejectsEmptyScanimageOutput(t *testing.T) {
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
 
 	dest := filepath.Join(dir, "page.pdf")
-	err := s.ScanPage(t.Context(), scan.Request{Dest: dest})
+	err := scanPage(t.Context(), s, scan.Request{Dest: dest})
 	if err == nil {
 		t.Fatal("want error for an empty scan, got nil")
 	}
@@ -217,7 +227,7 @@ exit 1
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
 
 	dest := filepath.Join(dir, "page.pdf")
-	err := s.ScanPage(t.Context(), scan.Request{Dest: dest})
+	err := scanPage(t.Context(), s, scan.Request{Dest: dest})
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -235,7 +245,7 @@ func TestSaneScannerReportsMagickFailure(t *testing.T) {
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
 
 	dest := filepath.Join(dir, "page.pdf")
-	err := s.ScanPage(t.Context(), scan.Request{Dest: dest})
+	err := scanPage(t.Context(), s, scan.Request{Dest: dest})
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -253,7 +263,7 @@ func TestSaneScannerReportsImg2pdfFailure(t *testing.T) {
 	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
 
 	dest := filepath.Join(dir, "page.pdf")
-	err := s.ScanPage(t.Context(), scan.Request{Dest: dest})
+	err := scanPage(t.Context(), s, scan.Request{Dest: dest})
 	if err == nil {
 		t.Fatal("want error, got nil")
 	}
@@ -309,7 +319,7 @@ sleep 30
 
 	dest := filepath.Join(dir, "page.pdf")
 	start := time.Now()
-	err := s.ScanPage(t.Context(), scan.Request{Dest: dest})
+	err := scanPage(t.Context(), s, scan.Request{Dest: dest})
 	if err == nil {
 		t.Fatal("want timeout error, got nil")
 	}

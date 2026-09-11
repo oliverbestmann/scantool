@@ -24,6 +24,7 @@ var actionLabels = map[store.Kind]string{
 	store.KindSessionStarted:   "Session started",
 	store.KindPageScanned:      "Page scanned",
 	store.KindScanFailed:       "Scan failed",
+	store.KindPageProcessed:    "Page processed",
 	store.KindProcessFailed:    "Processing failed",
 	store.KindSessionSaved:     "Document stored",
 	store.KindSessionDiscarded: "Session discarded",

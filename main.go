@@ -142,8 +142,9 @@ func run() error {
 	// Key presses and web requests both feed the single action loop, so only
 	// one scan runs at a time. Both channels are unbuffered: presses and web
 	// clicks that arrive while the loop is busy handling a previous one are
-	// discarded (dropped for keys, rejected with an error for the web), not
-	// queued.
+	// not queued. A key press waits up to keys.sendTimeout for the loop to
+	// become free before being dropped; a web click is rejected with an
+	// error immediately.
 	keyCh := make(chan rune)
 	actionCh := make(chan webAction)
 
@@ -347,7 +348,7 @@ func newUploader(cfg config) (session.Uploader, error) {
 // SCAN_HEIGHT environment variables (the same ones the former scan-page.sh
 // script read, plus SCAN_WIDTH/SCAN_HEIGHT which default to A4). --dev-scanner
 // fakes it instead, for development without hardware.
-func newScanner(cfg config) scan.Scanner {
+func newScanner(cfg config) scan.TwoPhaseScanner {
 	if cfg.devScanner {
 		return &scan.DevScanner{}
 	}

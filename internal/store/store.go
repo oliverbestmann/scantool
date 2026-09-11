@@ -41,6 +41,7 @@ const (
 	KindSessionStarted   Kind = "session-started"
 	KindPageScanned      Kind = "page-scanned"
 	KindScanFailed       Kind = "scan-failed"
+	KindPageProcessed    Kind = "page-processed"
 	KindProcessFailed    Kind = "process-failed"
 	KindSessionSaved     Kind = "session-saved"
 	KindSessionDiscarded Kind = "session-discarded"

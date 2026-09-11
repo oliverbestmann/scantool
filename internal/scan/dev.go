@@ -31,24 +31,33 @@ type DevScanner struct {
 	Delay time.Duration
 }
 
-// ScanPage waits and then writes a blank page PDF to req.Dest.
-func (s *DevScanner) ScanPage(ctx context.Context, req Request) error {
+// AcquireImage waits Delay, simulating the hardware-bound half of a real
+// scan, and returns a placeholder image for ProcessImage to ignore.
+func (s *DevScanner) AcquireImage(ctx context.Context, req Request) ([]byte, error) {
 	delay := s.Delay
 	if delay <= 0 {
-		delay = 3 * time.Second
+		delay = 2 * time.Second
 	}
 
 	select {
 	case <-time.After(delay):
 	case <-ctx.Done():
-		return ctx.Err()
+		return nil, ctx.Err()
 	}
 
+	return nil, nil
+}
+
+// ProcessImage writes a blank page PDF (and thumbnail) to req.Dest. The
+// image is ignored: there is nothing real to convert.
+func (s *DevScanner) ProcessImage(ctx context.Context, req Request, image []byte) error {
 	if req.ThumbDest != "" {
 		if err := writeBlankThumbnail(req.ThumbDest); err != nil {
 			return err
 		}
 	}
+
+	time.Sleep(2 * time.Second)
 
 	return writeBlankPDF(req.Dest)
 }
