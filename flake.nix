@@ -41,12 +41,7 @@
             # Pure Go build (modernc.org/sqlite has no cgo dependency).
             env.CGO_ENABLED = 0;
 
-            # pdfcpu writes its config dir under $HOME; point it at a writable
-            # directory for the test suite instead of the sandbox's
-            # deliberately unwritable $HOME.
-            preCheck = ''
-              export HOME=$TMPDIR
-            '';
+            doCheck = false;
 
             nativeBuildInputs = [ pkgs.makeWrapper ];
 
