@@ -55,6 +55,82 @@ func (f *fakeScanner) count() int {
 	return len(f.requests)
 }
 
+// fakePipelinedScanner is a scan.TwoPhaseScanner test double. AcquireImage
+// always returns right away; ProcessImage optionally blocks on a per-page
+// gate (so a test can hold page N "processing" while it acquires page N+1)
+// and optionally fails for a given page (so tests can exercise the abort
+// path). Every ProcessImage call, successful or not, sends its request on
+// done so tests can wait for it deterministically instead of sleeping.
+type fakePipelinedScanner struct {
+	mu          sync.Mutex
+	acquired    []scan.Request
+	processed   []scan.Request
+	processErrs map[int]error
+	gate        map[int]chan struct{}
+	done        chan scan.Request
+}
+
+func newFakePipelinedScanner() *fakePipelinedScanner {
+	return &fakePipelinedScanner{
+		processErrs: map[int]error{},
+		gate:        map[int]chan struct{}{},
+		done:        make(chan scan.Request, 16),
+	}
+}
+
+func (f *fakePipelinedScanner) ScanPage(ctx context.Context, req scan.Request) error {
+	image, err := f.AcquireImage(ctx, req)
+	if err != nil {
+		return err
+	}
+	return f.ProcessImage(ctx, req, image)
+}
+
+func (f *fakePipelinedScanner) AcquireImage(_ context.Context, req scan.Request) ([]byte, error) {
+	f.mu.Lock()
+	f.acquired = append(f.acquired, req)
+	f.mu.Unlock()
+	return []byte(fmt.Sprintf("session %d page %d\n", req.SessionID, req.Page)), nil
+}
+
+func (f *fakePipelinedScanner) ProcessImage(_ context.Context, req scan.Request, image []byte) error {
+	f.mu.Lock()
+	gate := f.gate[req.Page]
+	err := f.processErrs[req.Page]
+	f.mu.Unlock()
+
+	if gate != nil {
+		<-gate
+	}
+
+	f.mu.Lock()
+	f.processed = append(f.processed, req)
+	f.mu.Unlock()
+	defer func() { f.done <- req }()
+
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(req.Dest, image, 0o644)
+}
+
+func (f *fakePipelinedScanner) acquiredCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.acquired)
+}
+
+func (f *fakePipelinedScanner) hasProcessed(page int) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, req := range f.processed {
+		if req.Page == page {
+			return true
+		}
+	}
+	return false
+}
+
 // fakeUploader stands in for the lemmary client.
 type fakeUploader struct {
 	mu    sync.Mutex
@@ -523,6 +599,100 @@ func TestFailedMergeKeepsScannedPages(t *testing.T) {
 
 	if state := h.manager.State(); state.SessionActive {
 		t.Fatalf("state = %+v, want the failed session to be closed", state)
+	}
+}
+
+func TestScanOverlapsWithProcessing(t *testing.T) {
+	scanner := newFakePipelinedScanner()
+	scanner.gate[1] = make(chan struct{})
+
+	h := newHarness(t, func(o *session.Options) { o.Scanner = scanner })
+
+	h.press('a')
+	if n := scanner.acquiredCount(); n != 1 {
+		t.Fatalf("acquired = %d, want 1", n)
+	}
+
+	// Page 1's processing is blocked on its gate; acquiring page 2 must not
+	// wait for it.
+	h.press('b')
+	if n := scanner.acquiredCount(); n != 2 {
+		t.Fatalf("acquired = %d, want 2 (page 2 acquired while page 1 was still processing)", n)
+	}
+
+	// Page 2 has no gate, so it finishes processing right away, proving the
+	// two pages' processing steps run independently of each other.
+	if req := <-scanner.done; req.Page != 2 {
+		t.Fatalf("first page to finish processing = %d, want 2", req.Page)
+	}
+	if scanner.hasProcessed(1) {
+		t.Fatal("page 1 was processed despite its gate still being closed")
+	}
+
+	close(scanner.gate[1])
+	if req := <-scanner.done; req.Page != 1 {
+		t.Fatalf("second page to finish processing = %d, want 1", req.Page)
+	}
+
+	h.press('c')
+
+	// Pages are recorded in acquisition order, so the document comes out in
+	// the right order regardless of which one finished processing first.
+	want := "session 1 page 1\nsession 1 page 2\n"
+	if got := h.readDocument("20260908-114400.pdf"); got != want {
+		t.Fatalf("document content = %q, want %q", got, want)
+	}
+}
+
+func TestBackgroundProcessingFailureAbortsSession(t *testing.T) {
+	scanner := newFakePipelinedScanner()
+	scanner.processErrs[1] = errors.New("disk full")
+
+	h := newHarness(t, func(o *session.Options) { o.Scanner = scanner })
+
+	h.press('a')
+	<-scanner.done // wait for page 1's background processing to finish (and fail)
+
+	state := h.manager.State()
+	if state.Status != session.StatusError {
+		t.Fatalf("status = %q, want error", state.Status)
+	}
+	if !strings.Contains(state.LastError, "disk full") {
+		t.Fatalf("last error = %q", state.LastError)
+	}
+
+	// The session cannot produce a valid document anymore: further scans
+	// into it are refused,
+	if err := h.manager.Do(t.Context(), session.ActionScanPage); err == nil || !strings.Contains(err.Error(), "disk full") {
+		t.Fatalf("scan after abort: err = %v, want the abort error", err)
+	}
+	// and "c" fails it instead of merging a document silently missing its
+	// page.
+	if err := h.manager.Do(t.Context(), session.ActionFinish); err == nil {
+		t.Fatal("finish after abort: want an error")
+	}
+
+	if docs := h.documents(); len(docs) != 0 {
+		t.Fatalf("documents = %v, want none", docs)
+	}
+
+	sessions := h.sessions()
+	if len(sessions) != 1 || sessions[0].Status != store.StatusFailed {
+		t.Fatalf("sessions = %+v, want one failed session", sessions)
+	}
+
+	foundProcessFailed := false
+	for _, k := range h.actionKinds() {
+		if k == store.KindProcessFailed {
+			foundProcessFailed = true
+		}
+	}
+	if !foundProcessFailed {
+		t.Fatal("action log missing a process-failed entry")
+	}
+
+	if state := h.manager.State(); state.SessionActive {
+		t.Fatalf("state = %+v, want the aborted session to be closed", state)
 	}
 }
 

@@ -265,6 +265,40 @@ func TestSaneScannerReportsImg2pdfFailure(t *testing.T) {
 	}
 }
 
+func TestSaneScannerImplementsTwoPhaseScanner(t *testing.T) {
+	var _ scan.TwoPhaseScanner = (*scan.SaneScanner)(nil)
+}
+
+func TestSaneScannerAcquireThenProcessImage(t *testing.T) {
+	dir := t.TempDir()
+	scanimage := writeTool(t, dir, "scanimage", `echo "P6 fake pnm"`)
+	magick := writeTool(t, dir, "magick", `cat > "$7"`)
+	img2pdf := writeTool(t, dir, "img2pdf", `echo "%PDF-1.4 fake page" > "$2"`)
+
+	s := &scan.SaneScanner{ScanimageCmd: scanimage, MagickCmd: magick, Img2pdfCmd: img2pdf}
+
+	image, err := s.AcquireImage(t.Context(), scan.Request{})
+	if err != nil {
+		t.Fatalf("AcquireImage: %v", err)
+	}
+	if !strings.Contains(string(image), "P6 fake pnm") {
+		t.Fatalf("acquired image = %q", image)
+	}
+
+	dest := filepath.Join(dir, "page.pdf")
+	if err := s.ProcessImage(t.Context(), scan.Request{Dest: dest}, image); err != nil {
+		t.Fatalf("ProcessImage: %v", err)
+	}
+
+	got, err := os.ReadFile(dest)
+	if err != nil {
+		t.Fatalf("processed page missing: %v", err)
+	}
+	if !strings.HasPrefix(string(got), "%PDF") {
+		t.Fatalf("page content = %q", got)
+	}
+}
+
 func TestSaneScannerTimesOut(t *testing.T) {
 	dir := t.TempDir()
 	scanimage := writeTool(t, dir, "scanimage", `

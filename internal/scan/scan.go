@@ -37,6 +37,24 @@ type Func func(ctx context.Context, req Request) error
 
 func (f Func) ScanPage(ctx context.Context, req Request) error { return f(ctx, req) }
 
+// TwoPhaseScanner is implemented by scanners that can separate the
+// hardware-bound half of a scan from turning the result into a PDF. Callers
+// that want to scan the next page while the previous one is still
+// converting (the conversion needs no scanner) use this instead of
+// ScanPage. *SaneScanner is the only implementation; DevScanner does both
+// halves as one step and only implements Scanner.
+type TwoPhaseScanner interface {
+	Scanner
+
+	// AcquireImage does the part of scanning that needs the scanner
+	// hardware and returns the raw image. Calls to AcquireImage must never
+	// overlap with each other.
+	AcquireImage(ctx context.Context, req Request) ([]byte, error)
+	// ProcessImage turns a previously acquired image into a single page PDF
+	// at req.Dest. Safe to run concurrently with the next AcquireImage.
+	ProcessImage(ctx context.Context, req Request, image []byte) error
+}
+
 // tail returns the last few lines of command output, formatted for appending
 // to an error message.
 func tail(s string) string {

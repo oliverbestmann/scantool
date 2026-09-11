@@ -183,6 +183,16 @@ type activeSession struct {
 	startedAt time.Time
 	dir       string
 	pages     []string
+
+	// pending tracks background ProcessImage calls dispatched by a
+	// TwoPhaseScanner, so finish/discard can wait for them before touching
+	// the work directory or merging pages. Add and Wait are only ever
+	// called while runMu is held, so they never race with each other.
+	pending sync.WaitGroup
+	// abortErr is set by a failed background ProcessImage call. Once set,
+	// the session can no longer be saved; guarded by Manager.mu since a
+	// processing goroutine sets it outside of runMu.
+	abortErr error
 }
 
 // New creates a Manager and prepares the output and work directories.
@@ -369,8 +379,11 @@ func (m *Manager) hasPages() bool {
 	return m.cur != nil && len(m.cur.pages) > 0
 }
 
-// scan appends one page to the current session, starting one if needed.
-// Must be called with runMu held.
+// scan appends one page to the current session, starting one if needed. If
+// the scanner can separate acquiring the image from turning it into a PDF
+// (scan.TwoPhaseScanner), the PDF is produced by a background goroutine so
+// the next page can be acquired right away instead of waiting for it. Must
+// be called with runMu held.
 func (m *Manager) scan(ctx context.Context) error {
 	if m.cur == nil {
 		if err := m.start(); err != nil {
@@ -380,9 +393,20 @@ func (m *Manager) scan(ctx context.Context) error {
 	}
 
 	cur := m.cur
+
+	m.mu.Lock()
+	abortErr := cur.abortErr
+	m.mu.Unlock()
+	if abortErr != nil {
+		// A page failed to process in the background. The session cannot
+		// produce a valid document anymore; "c" or a discard clears it.
+		return abortErr
+	}
+
 	page := len(cur.pages) + 1
 	dest := filepath.Join(cur.dir, fmt.Sprintf("page-%03d.pdf", page))
 	thumbDest := thumbPath(dest)
+	req := scan.Request{Dest: dest, SessionID: cur.id, Page: page, Resolution: resolutionFromContext(ctx), ThumbDest: thumbDest}
 
 	log := m.opts.Logger.With("session", cur.id, "page", page)
 	log.Info("scanning page")
@@ -390,25 +414,26 @@ func (m *Manager) scan(ctx context.Context) error {
 	m.setStatus(StatusScanning)
 
 	started := m.opts.Now()
-	req := scan.Request{Dest: dest, SessionID: cur.id, Page: page, Resolution: resolutionFromContext(ctx), ThumbDest: thumbDest}
-	if err := m.opts.Scanner.ScanPage(ctx, req); err != nil {
-		// The session stays open on purpose: pressing "b" retries the page
-		// without losing the pages scanned so far.
-		log.Error("scan failed", "error", err)
-		m.record(store.Action{
-			Kind:      store.KindScanFailed,
-			SessionID: cur.id,
-			Page:      page,
-			Error:     err.Error(),
-		})
-		m.fail(err)
-		return err
+
+	if two, ok := m.opts.Scanner.(scan.TwoPhaseScanner); ok {
+		image, err := two.AcquireImage(ctx, req)
+		if err != nil {
+			return m.scanFailed(cur, page, err, log)
+		}
+
+		cur.pending.Add(1)
+		go m.processPage(two, cur, req, image, log)
+	} else if err := m.opts.Scanner.ScanPage(ctx, req); err != nil {
+		return m.scanFailed(cur, page, err, log)
 	}
 
-	// The page is on disk; recording it and its action atomically keeps the
-	// database's page count and action log from ever disagreeing with each
-	// other, even though a recording failure itself must not lose the page
-	// that was already scanned.
+	// The page is on disk, or (for a TwoPhaseScanner) being written by the
+	// background goroutine just started; recording it and its action
+	// atomically keeps the database's page count and action log from ever
+	// disagreeing with each other, even though a recording failure itself
+	// must not lose the page that was already scanned. The size in the
+	// detail is best effort: for a TwoPhaseScanner the file usually is not
+	// there yet, so it is simply omitted.
 	detail := pageScanDetail(dest, m.opts.Now().Sub(started))
 	if err := m.opts.Recorder.AddPage(cur.id, page, dest, store.Action{Kind: store.KindPageScanned, SessionID: cur.id, Page: page, Detail: detail}); err != nil {
 		log.Warn("could not record scanned page", "error", err)
@@ -418,19 +443,46 @@ func (m *Manager) scan(ctx context.Context) error {
 	cur.pages = append(cur.pages, dest)
 	pages := len(cur.pages)
 	m.state.Pages = pages
-	m.state.PageSizesKB = append(m.state.PageSizesKB, pageSizeKB(dest))
-	if _, err := os.Stat(thumbDest); err == nil {
-		m.state.Thumbnails = append(m.state.Thumbnails, thumbDest)
-	} else {
-		m.state.Thumbnails = append(m.state.Thumbnails, "")
-	}
+	m.state.PageSizesKB = append(m.state.PageSizesKB, 0)
+	m.state.Thumbnails = append(m.state.Thumbnails, "")
 	m.state.Status = StatusIdle
 	m.state.Since = m.opts.Now()
 	m.state.LastError = ""
 	m.mu.Unlock()
 
+	// For a synchronous Scanner, dest and thumbDest already exist by now.
+	// For a TwoPhaseScanner they usually don't yet; processPage calls this
+	// again once the background conversion finishes.
+	m.updatePageResult(cur.id, page, dest, thumbDest)
+
 	log.Info("page scanned", "pages", pages)
 	return nil
+}
+
+// updatePageResult refreshes a page's size and thumbnail in the state once
+// its PDF (and thumbnail) exist on disk. Called right after a synchronous
+// scan, and again by processPage when a TwoPhaseScanner's background
+// conversion completes. A page whose file is not there yet is simply left
+// as is; it is safe to call more than once for the same page.
+func (m *Manager) updatePageResult(sessionID int64, page int, dest, thumbDest string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.cur == nil || m.cur.id != sessionID {
+		return
+	}
+
+	idx := page - 1
+	if idx < 0 || idx >= len(m.state.PageSizesKB) {
+		return
+	}
+
+	if size := pageSizeKB(dest); size > 0 {
+		m.state.PageSizesKB[idx] = size
+	}
+	if _, err := os.Stat(thumbDest); err == nil {
+		m.state.Thumbnails[idx] = thumbDest
+	}
 }
 
 // pageSizeKB is the size of the page file at path, rounded up to the next
@@ -485,6 +537,53 @@ func pageScanDetail(path string, elapsed time.Duration) string {
 	return detail
 }
 
+// scanFailed records a failed acquisition of a page. The session stays open
+// on purpose: pressing "b" retries the page without losing the pages
+// scanned so far. Must be called with runMu held.
+func (m *Manager) scanFailed(cur *activeSession, page int, err error, log *slog.Logger) error {
+	log.Error("scan failed", "error", err)
+	m.record(store.Action{
+		Kind:      store.KindScanFailed,
+		SessionID: cur.id,
+		Page:      page,
+		Error:     err.Error(),
+	})
+	m.fail(err)
+	return err
+}
+
+// processPage is a TwoPhaseScanner's slow half, run in the background by
+// scan so the next page can be acquired while this one converts. A failure
+// aborts the session (see activeSession.abortErr): by the time it happens,
+// later pages may already be queued behind this one, so there is no sound
+// way to drop just this page and keep going. It uses a context detached
+// from the one scan() was called with, since that call has already
+// returned by the time this runs.
+func (m *Manager) processPage(two scan.TwoPhaseScanner, cur *activeSession, req scan.Request, image []byte, log *slog.Logger) {
+	defer cur.pending.Done()
+
+	if err := two.ProcessImage(context.Background(), req, image); err != nil {
+		log.Error("processing page failed", "error", err)
+
+		m.mu.Lock()
+		if cur.abortErr == nil {
+			cur.abortErr = err
+		}
+		m.mu.Unlock()
+
+		m.record(store.Action{
+			Kind:      store.KindProcessFailed,
+			SessionID: cur.id,
+			Page:      req.Page,
+			Error:     err.Error(),
+		})
+		m.fail(err)
+		return
+	}
+
+	m.updatePageResult(cur.id, req.Page, req.Dest, req.ThumbDest)
+}
+
 // start opens a new session. Must be called with runMu held.
 func (m *Manager) start() error {
 	now := m.opts.Now()
@@ -522,13 +621,42 @@ func (m *Manager) finish(ctx context.Context, upload bool) error {
 		return nil
 	}
 
+	// A page recorded via AddPage does not really exist on disk until its
+	// background processing goroutine (if any) finishes; wait for them all
+	// before deciding whether there is anything to merge.
+	cur.pending.Wait()
+
+	log := m.opts.Logger.With("session", cur.id)
+
+	m.mu.Lock()
+	abortErr := cur.abortErr
+	m.mu.Unlock()
+
+	if abortErr != nil {
+		// The scratch directory is kept so the pages can be recovered by hand.
+		log.Error("could not store session: a page failed to process", "error", abortErr, "pages_dir", cur.dir)
+		recErr := m.opts.Recorder.FinishSessionWithAction(cur.id, m.opts.Now(), store.StatusFailed, "", abortErr.Error(),
+			store.Action{
+				Kind:      store.KindSaveFailed,
+				SessionID: cur.id,
+				Page:      len(cur.pages),
+				Detail:    cur.dir,
+				Error:     abortErr.Error(),
+			})
+		if recErr != nil {
+			log.Warn("could not record failed session", "error", recErr)
+		}
+		m.clear(StatusError)
+		m.fail(abortErr)
+		return abortErr
+	}
+
 	// An empty session has nothing worth storing, e.g. "c" right after a
 	// failed first scan.
 	if len(cur.pages) == 0 {
 		return m.discard()
 	}
 
-	log := m.opts.Logger.With("session", cur.id)
 	now := m.opts.Now()
 
 	m.setStatus(StatusSaving)
@@ -596,6 +724,10 @@ func (m *Manager) discard() error {
 		m.opts.Logger.Info("no active session to discard")
 		return nil
 	}
+
+	// Let any background page processing finish (or fail) before removing
+	// the work directory it reads and writes.
+	cur.pending.Wait()
 
 	log := m.opts.Logger.With("session", cur.id)
 	now := m.opts.Now()

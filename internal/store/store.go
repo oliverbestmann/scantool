@@ -41,6 +41,7 @@ const (
 	KindSessionStarted   Kind = "session-started"
 	KindPageScanned      Kind = "page-scanned"
 	KindScanFailed       Kind = "scan-failed"
+	KindProcessFailed    Kind = "process-failed"
 	KindSessionSaved     Kind = "session-saved"
 	KindSessionDiscarded Kind = "session-discarded"
 	KindSaveFailed       Kind = "save-failed"
@@ -51,7 +52,7 @@ const (
 // Failed reports whether the action describes something going wrong.
 func (k Kind) Failed() bool {
 	switch k {
-	case KindScanFailed, KindSaveFailed, KindUploadFailed:
+	case KindScanFailed, KindProcessFailed, KindSaveFailed, KindUploadFailed:
 		return true
 	default:
 		return false

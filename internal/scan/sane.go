@@ -47,8 +47,35 @@ type SaneScanner struct {
 	Timeout time.Duration
 }
 
-// ScanPage scans one page and writes a single page PDF to req.Dest.
+// ScanPage scans one page and writes a single page PDF to req.Dest. It is
+// AcquireImage followed by ProcessImage; callers that want the scanner
+// hardware freed up for the next page while this one converts should call
+// the two separately instead (see TwoPhaseScanner).
 func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
+	image, err := s.AcquireImage(ctx, req)
+	if err != nil {
+		return err
+	}
+	return s.ProcessImage(ctx, req, image)
+}
+
+// AcquireImage is the hardware-bound half of ScanPage: it runs scanimage and
+// returns its raw PNM output. Calls to AcquireImage must not overlap with
+// each other, since they drive the same physical scanner; ProcessImage may
+// run concurrently with the next AcquireImage.
+func (s *SaneScanner) AcquireImage(ctx context.Context, req Request) ([]byte, error) {
+	if s.Timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
+		defer cancel()
+	}
+	return s.scanImage(ctx, req.Resolution)
+}
+
+// ProcessImage is the CPU-bound half of ScanPage: it turns a PNM image
+// previously returned by AcquireImage into a single page PDF at req.Dest.
+// Safe to run concurrently with the next page's AcquireImage.
+func (s *SaneScanner) ProcessImage(ctx context.Context, req Request, image []byte) error {
 	if s.Timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, s.Timeout)
@@ -61,13 +88,8 @@ func (s *SaneScanner) ScanPage(ctx context.Context, req Request) error {
 	}
 	defer os.RemoveAll(tmp)
 
-	pnm, err := s.scanImage(ctx, req.Resolution)
-	if err != nil {
-		return err
-	}
-
 	jpg := filepath.Join(tmp, "page.jpg")
-	if err := s.runTool(ctx, s.cmd(s.MagickCmd, "magick"), bytes.NewReader(pnm),
+	if err := s.runTool(ctx, s.cmd(s.MagickCmd, "magick"), bytes.NewReader(image),
 		"convert", "-quality", "95", "-level", "0%,90%", "pnm:-", jpg); err != nil {
 		return fmt.Errorf("scan: convert: %w", err)
 	}

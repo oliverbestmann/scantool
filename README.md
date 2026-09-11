@@ -127,6 +127,16 @@ always use the configured default.
 A cancelled or timed out scan kills the whole process group, so a hanging
 `scanimage` cannot keep the scanner busy.
 
+Only `scanimage` needs exclusive access to the scanner; `magick` and
+`img2pdf` are plain CPU work. So the built-in scanner runs them in the
+background, letting the next page's `scanimage` start as soon as the current
+one finishes instead of waiting for its conversion too. A page that fails to
+convert aborts the whole document — by the time it happens later pages may
+already be queued behind it, so the session is marked failed instead of
+silently merging one short. `--scan-command` scripts don't get this overlap:
+scantool has no way to split hardware access from conversion inside an
+opaque external command.
+
 `--dev-scanner` fakes the scanner instead: it waits 3s and writes a blank
 page, so the rest of scantool (sessions, merging, the web UI) can be
 exercised without a scanner attached.
