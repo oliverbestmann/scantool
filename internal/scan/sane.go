@@ -78,7 +78,7 @@ func (s *SaneScanner) ProcessImage(ctx context.Context, req Request, image []byt
 
 	jpg := filepath.Join(tmp, "page.jpg")
 	if err := s.runTool(ctx, s.cmd(s.MagickCmd, "magick"), bytes.NewReader(image),
-		"convert", "-quality", "95", "-level", "0%,90%", "pnm:-", jpg); err != nil {
+		"convert", "-quality", "95", "-level", "5%,90%", "pnm:-", jpg); err != nil {
 		return fmt.Errorf("scan: convert: %w", err)
 	}
 
@@ -118,6 +118,7 @@ func (s *SaneScanner) scanImage(ctx context.Context, reqResolution string) ([]by
 	}
 
 	args := []string{
+		"--device=pixma:04A91912_51F58A",
 		"--format=pnm", "--resolution", resolution, "--mode", s.mode(),
 		"-x", s.width(), "-y", s.height(),
 	}

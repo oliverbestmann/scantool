@@ -664,7 +664,13 @@ func TestBackgroundProcessingFailureAbortsSession(t *testing.T) {
 	h.press('a')
 	<-scanner.done // wait for page 1's background processing to finish (and fail)
 
+	// done fires inside ProcessImage, before the manager records the failure;
+	// Processing drops to 0 only after that.
 	state := h.manager.State()
+	for state.Processing > 0 {
+		time.Sleep(time.Millisecond)
+		state = h.manager.State()
+	}
 	if state.Status != session.StatusError {
 		t.Fatalf("status = %q, want error", state.Status)
 	}

@@ -66,9 +66,18 @@
           default = scantool;
         };
 
-        devShells.default = pkgs.mkShell {
-          packages = [ pkgs.go pkgs.gofumpt pkgs.gopls ];
-        };
+        devShells.default =
+          let
+            # Same SANE wiring as services.scantool.extraSaneBackends.
+            saneConfig = pkgs.mkSaneConfig {
+              paths = [ pkgs.sane-backends self.packages.${system}.scangearmp2Headless ];
+            };
+          in
+          pkgs.mkShell {
+            packages = [ pkgs.go pkgs.gofumpt pkgs.gopls ] ++ self.packages.${system}.scanPageRuntimeInputs;
+            SANE_CONFIG_DIR = "${saneConfig}/etc/sane.d";
+            LD_LIBRARY_PATH = "${saneConfig}/lib/sane";
+          };
       }) // {
         overlays.default = final: prev: {
           scantool = self.packages.${final.system}.default;
